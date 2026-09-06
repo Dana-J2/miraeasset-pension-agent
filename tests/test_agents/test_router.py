@@ -106,10 +106,15 @@ def test_override_preserves_partial_scope():
 
 
 def test_in_kind_transfer_intent_routes_asset_preserving_procedure_to_info_only():
-    """'상품 그대로 이전할 수 있는 방법'은 상품 추천이 아니라 이전 제도 질문이다."""
+    """'상품 그대로 이전할 수 있는 방법'은 상품 추천이 아니라 이전 제도 질문이다.
+
+    ⚠️ candidate_categories가 계좌이전_절차 핸들러 도입 후 이 질문에 후보를 내도록
+    바뀌었다(정확한 근거 기반 답변이 가능해졌다). 이 테스트의 본래 목적인 "상품형
+    intent를 정보형으로 되돌리는지"는 계속 확인한다.
+    """
     question = "IRP 상품 그대로 이전할 수 있는 방법 알려줘"
 
-    assert candidate_categories(question) == []
+    assert "계좌이전_절차" in candidate_categories(question)
     assert _apply_in_kind_transfer_intent_override(["상품형"], question) == ["정보형"]
 
 
@@ -329,3 +334,83 @@ def test_override_leaves_safe_questions_untouched():
     from src.agents.router import _override_overblocked_safety
 
     assert _override_overblocked_safety(True, None, "연금저축 세액공제 한도는?") == (True, None)
+
+
+# ── 세제 폴백: 후보 0건이어도 정형 경로를 되살린다 ──────────────────────────────
+#
+# candidate_categories는 키워드로 "검토할 근거"를 판정하는데, 세제 영역에서 이 방식이
+# 반복적으로 무너졌다 — 사용자는 제도 용어를 모른 채 일상어로 묻기 때문이다
+# ("퇴직소득세" 대신 "퇴직금", "1,500만원 기준" 대신 본인 금액 "1,600만원").
+# 표현은 무한하고 키워드 목록은 유한해 커버리지 확장으로는 구조적으로 진다.
+# 그래서 세제에 한해 순서를 뒤집었다: 키워드로 차단하지 않고, 라우터가 "해당없음"을
+# 냈을 때 세제 핸들러에게 직접 물어본다(핸들러는 자기 소관이 아니면 None을 낸다).
+
+
+def test_tax_fallback_restores_category_when_candidates_empty():
+    """세제 질문은 후보가 비어도 정형 경로로 되살아난다."""
+    from src.agents.deterministic_info import candidate_categories
+    from src.agents.router import _restore_rejected_category
+
+    for question, expected in (
+        ("연금소득이 1600만원이야", "연금소득세_종합과세"),
+        ("일흔 넘었는데 연금소득세율이 어떻게 되나요?", "연금소득세율_연령별"),
+    ):
+        restored = _restore_rejected_category(
+            "해당없음", candidate_categories(question), question
+        )
+        assert restored == expected, question
+
+
+def test_tax_fallback_does_not_hijack_non_tax_questions():
+    """세제와 무관한 질문은 "해당없음"이 유지돼야 한다(오탈취 방지).
+
+    이 폴백의 안전은 "핸들러가 자기 소관이 아니면 스스로 None을 낸다"에 달려 있다.
+    잘 작동하는 다른 영역(중도인출·실물이전·디폴트옵션·상품추천)을 세제 카테고리가
+    가로채면 안 된다.
+
+    ⚠️ "DB형과 DC형 운용주체가 어떻게 다른가요?"는 예전엔 여기 있었으나, 이후
+    제도비교_DB_DC 핸들러가 생겨 **그 카테고리로 복원되는 것이 정답**이 됐다
+    (실측 no.1). 세제 카테고리로 잘못 복원되지 않는지만 확인한다.
+    """
+    from src.agents.deterministic_info import candidate_categories
+    from src.agents.router import _restore_rejected_category
+
+    for question in (
+        "안정적인 연금 상품 추천해줘",
+        "IRP 중도인출 신청은 어디서 하나요?",
+        "디폴트옵션 상품이 뭔가요?",
+        "솔로몬 국공채 단기랑 장기 뭐가 달라요?",
+    ):
+        restored = _restore_rejected_category(
+            "해당없음", candidate_categories(question), question
+        )
+        assert restored == "해당없음", question
+
+    # DB/DC 질문은 세제 카테고리로 새지 않고, DB/DC 전용 카테고리로 복원돼야 한다.
+    #
+    # ⚠️ 이 질문은 두 개의 독립적인 카테고리가 동시에 답할 수 있다 — 제도비교_DB_DC
+    # (같은 세션에서 no.1/no.27 재발 방지로 신설)와 퇴직연금_유형비교(팀원이 별도로
+    # 신설, 표 형식 + 회사 부담금 산식까지 포함해 정보량이 더 많다). candidate_categories
+    # 등록 순서상 퇴직연금_유형비교가 먼저 와 최종 확정된다 — 더 상세한 답변이 우선
+    # 채택되는 것이 맞다. 둘 다 살려두는 이유는 표현이 조금 달라지면 한쪽만 걸리는
+    # 경우가 실측으로 반복됐기 때문이다(어간 활용형 나열 방식의 구조적 한계).
+    question = "DB형과 DC형 운용주체가 어떻게 다른가요?"
+    restored = _restore_rejected_category("해당없음", candidate_categories(question), question)
+    assert restored == "퇴직연금_유형비교", question
+
+
+def test_calculation_shortage_stays_out_of_overridable_set():
+    """세액공제_계산_입력부족은 CODE_OVERRIDABLE에 넣으면 안 된다(후보 순서 회귀).
+
+    이 집합은 후보가 **있을 때의** 첫 루프에도 쓰이는데, 후보 순서상 이 카테고리가
+    세액공제_한도보다 앞이라 넣는 순간 "얼마나 넣어야 하나요?"류 질문이 한도 안내
+    대신 "입력값이 부족하다"는 계산 보류 답변으로 바뀐다(실측 회귀).
+    """
+    from src.agents.deterministic_info import (
+        CODE_OVERRIDABLE_CATEGORIES,
+        TAX_FALLBACK_CATEGORIES,
+    )
+
+    assert "세액공제_계산_입력부족" not in CODE_OVERRIDABLE_CATEGORIES
+    # 후보 0건 폴백에서는 여전히 쓸 수 있어야 한다
+    assert "세액공제_계산_입력부족" in TAX_FALLBACK_CATEGORIES

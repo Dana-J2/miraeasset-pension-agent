@@ -1,6 +1,39 @@
 from src.agents.deterministic_info import candidate_categories, deterministic_response_for
 
 
+def test_retirement_plan_comparison_reaches_fact_contract():
+    """Q1 변형 질문은 DB/DC 핵심 사실 계약으로 닿아야 한다."""
+    for question in (
+        "DB하고 DC는 누가 운용해요?",
+        "DC형은 회사가 받을 퇴직금을 미리 정해주는 거 아니야?",
+        "DB와 DC는 퇴직금 계산 방식이 어떻게 달라?",
+        "운용하다 손실이 나면 DB와 DC 중 누가 부담해?",
+        "DB·DC·일반 퇴직금 제도를 한 번에 비교해줘.",
+        "Defined Benefit과 Defined Contribution의 차이는?",
+    ):
+        assert "퇴직연금_유형비교" in candidate_categories(question), question
+
+
+def test_retirement_plan_comparison_fact_contract_content():
+    """문장 전체가 아니라 DB/DC 불변 사실과 근거 연결을 고정한다."""
+    draft, context = deterministic_response_for(
+        "퇴직연금_유형비교", "DB와 DC의 운용 주체, 산식, 위험 부담을 비교해줘."
+    )
+
+    assert "DB(Defined Benefit" in draft
+    assert "DC(Defined Contribution" in draft
+    assert "회사가 적립금을 운용" in draft
+    assert "근로자가 직접 운용" in draft
+    assert "평균임금" in draft and "계속근로기간" in draft
+    assert "연간 임금총액의 1/12" in draft
+    assert "운용손익" in draft
+    assert "퇴직금제도" in draft
+    assert context
+    assert "doc10_chunk02" in context[0]["source"]
+    assert "source_id=doc10_chunk02" in context[0]["content"]
+    assert "version=" in context[0]["content"]
+
+
 def test_tax_credit_question_candidates_both_calc_and_limit():
     # 후보 단계는 주제어("세액공제")만 보고 둘 다 낸다 — 확정은 router의 LLM 몫이다.
     candidates = candidate_categories("연금저축이랑 IRP 다 합쳐서 세액공제 얼마까지 되나요?")
@@ -18,6 +51,33 @@ def test_tax_credit_limit_response_content():
     assert "1,500만원까지 세액공제되는 구조가 아니라" in draft
     assert context
     assert "연금저축+IRP 합산 900만원" in context[0]["content"]
+
+
+# ── ISA 만기 전환 세액공제 특례 (실측 20문항 스팟체크 T20) ────────────────────
+# "세액공제"라는 단어만 보고 세액공제_한도 후보가 걸려 라우터가 확정했는데, 그
+# 핸들러는 ISA를 다루지 않아 일반 900만원 답변(사실상 오답)이 나갔다. ISA 전환
+# 시 정답은 전환입금액의 10%(최대 300만원)가 추가로 붙어 900/1,200만원이다.
+
+
+def test_isa_conversion_question_gets_isa_specific_answer():
+    draft, context = deterministic_response_for(
+        "세액공제_한도", "ISA 만기됐는데 연금계좌로 전환하면 세액공제 어떻게 되나요?"
+    )
+
+    assert "300만원" in draft
+    assert "900만원" in draft and "1,200만원" in draft   # 연금저축/IRP 전환 각각의 정답
+    assert context and "ISA" in context[0]["source"]
+
+
+def test_non_isa_question_is_unaffected_by_isa_branch():
+    """ISA 언급이 없는 일반 세액공제 질문은 기존 답변 그대로 유지된다(회귀 방지)."""
+    draft, _ = deterministic_response_for(
+        "세액공제_한도", "세액공제 최대로 받으려면 얼마 넣어야 하나요?"
+    )
+
+    assert "합산 900만원" in draft
+    assert "1,200만원" not in draft
+    assert "300만원" not in draft
 
 
 def test_tax_benefit_overview_candidate_and_response():
@@ -119,12 +179,72 @@ def test_tax_credit_calculation_does_not_bleed_across_labels():
     assert "총급여 700만원" not in draft
 
 
+def test_tax_credit_parses_won_and_bare_manwon_amounts():
+    from src.agents.deterministic_info import extract_tax_credit_inputs
+
+    won_values = extract_tax_credit_inputs("연금저축에 6,000,000원 넣고 총급여 5000만원")
+    assert won_values["pension_savings_paid"] == 6_000_000
+    assert won_values["total_salary"] == 50_000_000
+
+    compact_values = extract_tax_credit_inputs("연금저축 500, IRP 400, 총급여 5000만원")
+    assert compact_values["pension_savings_paid"] == 5_000_000
+    assert compact_values["irp_paid"] == 4_000_000
+    assert compact_values["total_salary"] == 50_000_000
+
+
+def test_tax_credit_negative_amount_is_not_silently_absorbed():
+    draft, _ = deterministic_response_for(
+        "세액공제_계산_입력부족", "연금저축 -100만원, IRP 300만원, 총급여 5000만원이면 세액공제 얼마야?"
+    )
+
+    assert "음수" in draft
+    assert "세액공제액을 계산하지 않겠습니다" in draft
+    assert "-100만원" not in draft
+    assert "49만 5천원" not in draft
+
+
 def test_tax_credit_limit_answers_pension_savings_only_excess_directly():
     draft, _ = deterministic_response_for("세액공제_한도", "연금저축 900만원 넣었는데 전부 세액공제 되나요?")
 
     assert "아니요" in draft
     assert "연금저축만으로는 600만원까지만 세액공제 대상" in draft
     assert "연금저축 단독 한도를 넘는 금액: 300만원" in draft
+
+
+def test_tax_credit_limit_only_question_answers_without_income_regardless_of_category():
+    """"전부/기준으로 계산" 류 질문은 소득 없이도 답이 확정되므로, 라우터가
+    세액공제_한도·세액공제_계산_입력부족 어느 쪽을 확정해도 같은 정답이 나와야 한다.
+
+    회귀 방지(2026-09-06, 501문항 전수평가): no.75/no.312가 이 결함으로 역질문됐다.
+    둘 다 baseline(9/2)에서는 정답이 나갔었는데, candidate_categories가 항상 두
+    카테고리를 함께 후보로 올리는 구조라 라우터가 세액공제_계산_입력부족을
+    확정하면 소득을 요구하며 역질문으로 바뀌었다 — asks_all_credited 판정이
+    세액공제_한도 핸들러 안에만 있어서였다.
+    """
+    q_pension_only = "연금저축 601만원 넣었는데 전부 세액공제 되나요?"  # no.312
+    q_combined = "IRP에만 1000만원 넣었는데(납입한도 1800만원은 안 넘음) 세액공제는 900만원 기준으로 계산되나요?"  # no.75
+
+    for category in ("세액공제_한도", "세액공제_계산_입력부족"):
+        draft, _ = deterministic_response_for(category, q_pension_only)
+        assert "역질문" not in draft
+        assert "소득" not in draft.split("\n\n")[0]  # 첫 문단은 소득을 묻지 않고 바로 답한다
+        assert "아니요" in draft
+        assert "600만원까지만 세액공제 대상" in draft
+        assert "1만원" in draft  # 601 - 600 초과분
+
+        draft2, _ = deterministic_response_for(category, q_combined)
+        assert "네" in draft2.split("\n")[0]
+        assert "900만원까지만" in draft2 or "900만원 전액" in draft2
+        assert "100만원" in draft2  # 1000 - 900 초과분
+
+
+def test_tax_credit_combined_limit_answers_within_limit_case_directly():
+    """합산 납입액이 900만원 이내면(초과분 없이) 전액이 공제 대상이라고 답해야 한다."""
+    draft, _ = deterministic_response_for(
+        "세액공제_한도", "IRP에 700만원 넣었는데 세액공제는 700만원 기준으로 계산되나요?"
+    )
+    assert "700만원 전액" in draft
+    assert "소득" not in draft.split("\n\n")[0]
 
 
 def test_tax_credit_limit_answers_rate_when_only_income_given():
@@ -428,9 +548,19 @@ def test_account_level_transfer_is_not_in_kind_transfer():
     회귀 방지: 실측 no.367("연금저축 계좌를 해지하지 않고 다른 금융사로 옮기는 방법이
     있나요?")은 "옮기" 하나로 실물이전 카테고리가 붙어, 계좌이전 방법 대신 상품
     실물이전 **불가사유 목록**을 나열하는 동문서답이 나갔다.
+
+    ⚠️ 원래는 "candidate_categories(...) == []"였으나(당시 "보유 DB에 관련 문서가
+    없다"고 판단해 LLM 경로로 열어뒀다), 이후 계좌이전_절차 핸들러가 실물이전제도·
+    IRP 이체 규정을 근거로 정확히 이 질문에 답할 수 있음이 확인됐다(no.56도 같은
+    유형). 지금은 **실물이전_불가사유가 아니라 계좌이전_절차로** 가는 것이 정답이다.
     """
-    assert candidate_categories("연금저축 계좌를 해지하지 않고 다른 금융사로 옮기는 방법이 있나요?") == []
-    assert candidate_categories("IRP 계좌를 다른 증권사로 옮기고 싶어요") == []
+    for question in (
+        "연금저축 계좌를 해지하지 않고 다른 금융사로 옮기는 방법이 있나요?",
+        "IRP 계좌를 다른 증권사로 옮기고 싶어요",
+    ):
+        candidates = candidate_categories(question)
+        assert "실물이전_불가사유" not in candidates, question
+        assert "계좌이전_절차" in candidates, question
 
     # 상품 단위 실물이전 질문과 "실물이전" 용어를 쓴 질문은 그대로 유지된다.
     for question in (
@@ -920,8 +1050,13 @@ def test_personal_tax_candidates_positive_negative_collision():
 
 
 def test_broadened_candidates_do_not_overtrigger():
-    """넓혔다고 무관한 질문까지 후보가 생기면 안 된다."""
-    for question in ("IRP가 뭔가요?", "솔로몬 국공채 위험등급 알려줘", "DC와 DB 차이가 뭔가요?"):
+    """넓혔다고 무관한 질문까지 후보가 생기면 안 된다.
+
+    ⚠️ "DC와 DB 차이가 뭔가요?"는 예전엔 여기 있었으나, 이후 제도비교_DB_DC
+    핸들러가 생겨 후보가 나오는 것이 정답이 됐다(실측 no.1: 근거 없이 창작한
+    "평균 임금의 60%" 계산식을 정형 답변으로 대체). test_db_dc_comparison_* 참고.
+    """
+    for question in ("IRP가 뭔가요?", "솔로몬 국공채 위험등급 알려줘"):
         assert candidate_categories(question) == [], question
 
 
@@ -1432,3 +1567,410 @@ def test_calculable_question_still_computes_amount():
     )
 
     assert "99만원" in content
+
+
+# ── 어휘 커버리지 회귀: 동시출현(AND) 조건이 좁아 정형 경로를 놓친 사례 ──────────
+# 공통 원인: 키워드가 특정 동반어와 **함께** 나오기를 요구해, 사용자가 같은 의도를
+# 다른 말로 표현하면 후보가 0건이 되고 LLM 자유응답으로 새어 폐지된 수치를 답한다.
+
+
+def test_tax_saving_question_without_pension_word_routes():
+    """'절세'가 '연금/IRP'와 동시 출현하지 않아도 후보가 나와야 한다.
+
+    실측(2026-09-02 실사용): "65세로 정년 은퇴를 앞두고 있어... 절세 방법 알려줘"가
+    후보 0건이 되어 LLM이 "연간 최대 700만원"(폐지된 한도)을 지어냈다.
+    """
+    from src.agents.deterministic_info import candidate_categories
+
+    for question in (
+        "나는 올해 나이가 65세로 정년 은퇴를 앞두고 있어. 이런 내가 절세를 하고자하는데 방법 알려줘",
+        "65세인데 절세하고 싶어",
+        "절세 방법 알려줘",
+        "세금 줄이는 법 알려줘",
+    ):
+        assert "세금혜택_개요" in candidate_categories(question), question
+
+
+def test_tax_benefit_answer_covers_retirement_income_deduction():
+    """정년퇴직자에게 핵심인 이연퇴직소득세 감면이 정형 답변에 들어 있다."""
+    from src.agents.deterministic_info import deterministic_response_for
+
+    content, _ = deterministic_response_for(
+        "세금혜택_개요",
+        "나는 올해 나이가 65세로 정년 은퇴를 앞두고 있어. 이런 내가 절세를 하고자하는데 방법 알려줘",
+    )
+
+    assert "이연퇴직소득세" in content
+    assert "600만원" in content and "900만원" in content
+    assert "700만원" not in content   # 2023년 개정 전 폐지된 한도
+
+
+def test_contribution_order_question_routes_to_limit_category():
+    """한도를 묻지 않고 단정·확인하는 형태도 정형 경로를 타야 한다 (실측 no.383)."""
+    from src.agents.deterministic_info import candidate_categories
+
+    question = "연금저축을 먼저 600만원 채우고 IRP로 300만원 추가하는 순서가 맞나요?"
+
+    assert "세액공제_한도" in candidate_categories(question)
+
+
+def test_pension_tax_rate_by_name_routes():
+    """카테고리 이름 그대로 물어도 후보가 나와야 한다 (나이·수령 문맥 없이)."""
+    from src.agents.deterministic_info import candidate_categories
+
+    for question in ("연금소득세율 알려줘", "연금소득세율이 어떻게 되나요"):
+        assert "연금소득세율_연령별" in candidate_categories(question), question
+
+
+def test_widened_conditions_do_not_match_unrelated_questions():
+    """넓힌 조건이 무관한 질문까지 끌어오지 않는다."""
+    from src.agents.deterministic_info import candidate_categories
+
+    for question in ("점심 뭐 먹지", "펀드 추천해줘", "안녕하세요"):
+        assert candidate_categories(question) == [], question
+
+
+# ── 세제 답변의 scope qualifier 보존 (실측: "65세 정년퇴직 절세 방법") ──────────
+#
+# 5.5%/4.4%/3.3%는 **세액공제 받은 납입금·운용수익을 연금으로 수령**할 때의 세율이다.
+# 퇴직금(이연퇴직소득) 재원은 별도 감면 체계라, 숫자만 남기고 적용범위를 지우면
+# 재원이 뒤섞인 오답이 된다. 1,500만원 기준도 "과세대상 사적연금소득"이 조건이다.
+
+
+def test_tax_benefit_overview_uses_known_age_for_bracket():
+    """사용자가 나이를 밝혔으면 적용 구간을 확정해 준다(알고 있는 것을 되묻지 않는다)."""
+    draft, _ = deterministic_response_for(
+        "세금혜택_개요", "나 이제 정년 퇴직하는 65세인데, 노후를 위해서 절세를 많이 하고 싶어. 방법 알려줘"
+    )
+
+    assert "65세" in draft
+    assert "5.5%" in draft
+
+
+def test_tax_benefit_overview_scopes_age_rate_to_tax_credited_source():
+    """연령별 세율을 쓸 때 그 세율이 붙는 재원을 함께 밝히고, 퇴직금 재원과 구분한다."""
+    draft, _ = deterministic_response_for("세금혜택_개요", "65세인데 노후 절세 방법 알려줘")
+
+    assert "세액공제 받은 납입금과 운용수익" in draft
+    # 퇴직금 재원에는 이 세율이 적용되지 않는다는 점을 명시해야 한다
+    assert "퇴직금 재원에는 적용되지 않습니다" in draft
+
+
+def test_tax_benefit_overview_keeps_threshold_qualifier():
+    """1,500만원 기준에서 "과세대상 사적연금소득" 수식어를 지우지 않는다."""
+    draft, context = deterministic_response_for("세금혜택_개요", "노후를 위해 절세하고 싶어")
+
+    assert "과세대상 사적연금소득" in draft
+    assert "과세대상 사적연금소득" in context[0]["content"]
+
+
+def test_tax_benefit_overview_without_age_omits_bracket_line():
+    """나이를 안 밝혔으면 구간을 지어내지 않는다(과잉 확정 방지)."""
+    draft, _ = deterministic_response_for("세금혜택_개요", "노후를 위해 절세하고 싶어")
+
+    assert "말씀하신 만" not in draft
+
+
+def test_tax_benefit_overview_asks_only_for_missing_inputs():
+    """일반 전략은 먼저 답하고, 개인 계산에 필요한 것만 마지막에 되묻는다."""
+    draft, _ = deterministic_response_for("세금혜택_개요", "65세인데 노후 절세 방법 알려줘")
+
+    # 알고 있는 나이는 다시 묻지 않는다
+    assert "나이를 알려주세요" not in draft
+    # 재원 구분에 필요한 정보만 요청한다
+    assert "퇴직금 규모" in draft
+
+
+def test_retirement_pay_pension_tax_reaches_reduction_category():
+    """"퇴직금을 연금으로 받으면 세금?"은 이연퇴직소득세 감면 카테고리로 가야 한다.
+
+    실측 CASE 6("퇴직금 1억원을 연금으로 받으려고 해. 세금은?"): 제도 용어
+    "퇴직소득세"를 요구하는 조건 탓에 후보가 ['연금소득세율_연령별']뿐이었고,
+    **퇴직금 재원인데 사적연금소득 세율표(5.5/4.4/3.3%)**로 답하는 재원 혼동이 났다.
+    퇴직금은 이연퇴직소득세 감면 체계라 세율 체계 자체가 다르다.
+    """
+    for question in (
+        "퇴직금 1억원을 연금으로 받으려고 해. 세금은?",
+        "퇴직금을 연금으로 받으면 세금 얼마나 감면돼?",
+        "명퇴금을 연금으로 받으면 과세는?",
+    ):
+        assert "퇴직소득세감면" in candidate_categories(question), question
+
+
+def test_retirement_pay_without_pension_receipt_is_not_reduction_category():
+    """퇴직금을 말해도 연금수령 문맥이 없으면 감면 카테고리로 끌어오지 않는다."""
+    for question in (
+        "퇴직금을 일시금으로 받으면 얼마야?",
+        "퇴직금 중도인출 가능한가요?",
+        "퇴직금은 언제 받나요?",
+    ):
+        assert "퇴직소득세감면" not in candidate_categories(question), question
+
+
+def test_stated_pension_income_amount_reaches_comprehensive_tax():
+    """본인 연금소득 금액을 말하면 종합과세 안내 카테고리에 닿아야 한다.
+
+    실측 CASE 8("연금소득이 1600만원이야"): 후보 조건이 **기준값(1,500만원) 자체**를
+    말한 경우만 잡아서, 정작 규칙이 발동하는 상황(본인 금액이 기준을 넘음)에 후보가
+    0건이 됐다. 그러면 LLM 자유응답으로 새는데, 그 경로는 폐지된 수치를 지어내는
+    곳이라 통제 밖으로 나가는 것과 같다.
+
+    핸들러는 기준과 판정 대상 재원만 설명하고 사용자 금액이 과세대상인지는 단정하지
+    않으므로, 후보에 올려도 금액을 잘못 확정할 위험이 없다.
+    """
+    for question in (
+        "연금소득이 1600만원이야",
+        "연금소득이 1600만원인데 세금 어떻게 돼?",
+        "연금으로 연 1600만원 받으면 어떻게 되나요?",
+    ):
+        assert "연금소득세_종합과세" in candidate_categories(question), question
+
+
+def test_comprehensive_tax_answer_does_not_assume_taxable_source():
+    """사용자가 말한 금액을 자동으로 "과세대상 사적연금소득"으로 확정하지 않는다.
+
+    1,500만원 판정 대상은 세액공제 받은 납입금·운용수익뿐이고, 세액공제 받지 않은
+    원금과 퇴직금 재원은 제외된다 — 이 구분을 답변이 반드시 밝혀야 한다.
+    """
+    draft, _ = deterministic_response_for("연금소득세_종합과세", "사적연금소득 1600만원이면 종합과세인가요?")
+
+    assert "세액공제 받은 납입금과 운용수익 재원만 포함" in draft
+    assert "퇴직금 재원은 이 판정에서 제외" in draft
+
+
+def test_contribution_amounts_do_not_trigger_comprehensive_tax():
+    """납입액을 말한 질문은 종합과세 후보로 끌어오지 않는다(수령 vs 납입 구분)."""
+    for question in (
+        "연금저축에 600만원 넣으면 세액공제 얼마?",
+        "연금저축 한도가 얼마야?",
+    ):
+        assert "연금소득세_종합과세" not in candidate_categories(question), question
+
+
+def test_retirement_tax_reduction_uses_stated_receipt_year():
+    """연금실제수령연차를 밝히면 해당 구간의 감면율을 확정해 준다.
+
+    실측 T09/T10: 이 핸들러가 question을 받고도 전혀 읽지 않아, 사용자가 무엇을
+    말하든 항상 같은 일반표만 반환했다. 같은 질문이 라우터 선택에 따라
+    개인세금_입력충분성으로 가면 연차를 되묻는데(personal_tax_response) 이쪽으로 오면
+    되묻지도 확정하지도 않아, 답변 완결성이 라우터의 비결정적 선택에 좌우됐다.
+    """
+    draft, _ = deterministic_response_for("퇴직소득세감면", "연금실제수령연차 15년차면 퇴직금 감면율이 얼마인가요")
+
+    assert "15년차" in draft
+    assert "40%" in draft  # 11~20년차 = 60% 납부 / 40% 감면
+
+
+def test_retirement_tax_reduction_asks_for_year_when_missing():
+    """연차를 모르면 일반 규칙은 답하되 확정은 하지 않고 되묻는다."""
+    draft, _ = deterministic_response_for("퇴직소득세감면", "퇴직금 3억을 IRP로 받아서 연금으로 수령하면 세금이 어떻게 되나요")
+
+    assert "연금실제수령연차가 몇 년차인지 알려주세요" in draft
+
+
+def test_actual_receipt_year_question_reaches_reduction_category():
+    """"연금실제수령연차"는 이 카테고리 고유 개념어이므로 후보에 올라야 한다."""
+    for question in (
+        "연금실제수령연차 5년차인데 퇴직금 세금 얼마나 감면돼?",
+        "퇴직금 감면 얼마나 받나요",
+    ):
+        assert "퇴직소득세감면" in candidate_categories(question), question
+
+
+# ── 제도비교_DB_DC (실측 no.1/no.27: 근거 없이 "평균 임금의 60%" 창작) ──────────
+
+
+def test_db_dc_comparison_reaches_category_from_common_phrasings():
+    """DB/DC 제도 비교를 묻는 여러 표현이 후보에 올라야 한다."""
+    for question in (
+        "DC와 DB, 퇴직금이 정해지는 방식이랑 운용 주체가 어떻게 다른가요?",
+        "DB형은 제가 받을 퇴직금이 미리 확정돼 있는 게 맞나요?",
+        "DB와 DC 차이가 뭔가요?",
+        # 실측(20문항 스팟체크 T10): "확정돼있는/확정되어있는/확정된게" 목록에는
+        # 없던 자연스러운 변형 — 어간 활용형을 나열하면 반드시 다른 변형에서
+        # 뚫린다. 근거를 7건씩 갖고도 "평균 임금의 60배"를 창작한 no.1/no.27과
+        # 같은 실패가 정확히 이 표현에서 재현됐다.
+        "DB형은 회사가 운용하고 확정된 금액을 받는 거 맞나요?",
+        "DB형이면 금액이 확정인가요?",
+    ):
+        assert "제도비교_DB_DC" in candidate_categories(question), question
+
+
+def test_db_dc_comparison_answer_uses_correct_formula():
+    """근거에 있는 정확한 계산식을 쓴다 — 실측은 근거 없이 '60%'를 지어냈었다."""
+    draft, context = deterministic_response_for(
+        "제도비교_DB_DC", "DC와 DB, 퇴직금이 정해지는 방식이랑 운용 주체가 어떻게 다른가요?"
+    )
+
+    assert "30일분" in draft and "계속근로기간" in draft
+    assert "60%" not in draft   # 근거에 없는 창작 계산식
+    assert context  # 출처가 붙어야 한다
+
+
+def test_db_dc_comparison_reaches_from_conversion_phrasing_too():
+    """"바꾸면/전환하면 ~ 달라지나요"도 '차이/비교'와 같은 성격의 질문이다.
+
+    회귀 방지(2026-09-06, 501문항 전수평가 no.123): "DB형에서 DC형으로 바꾸면
+    세액공제나 투자 방식이 어떻게 달라지나요?"가 asks_comparison에 "바꾸면/달라지나요"
+    표현이 없어 정형 핸들러가 None을 반환했다. 그 결과 LLM이 no.1/no.27과 동일한
+    "평균 임금의 60% x 근속 연수"라는 근거 없는 DB 계산식을 다시 창작했다 —
+    이 카테고리를 만든 목적(창작 계산식 방지) 자체가 무력화된 재발 사례다.
+    """
+    question = "회사에서 DC형으로 전환한다는데, DB형에서 DC형으로 바꾸면 세액공제나 투자 방식이 어떻게 달라지나요?"
+    draft, context = deterministic_response_for("제도비교_DB_DC", question)
+
+    assert "30일분" in draft and "계속근로기간" in draft
+    assert "60%" not in draft
+    assert context
+
+
+def test_db_dc_comparison_declines_personal_calculation():
+    """구체적인 개인 계산 요구는 이 카테고리가 아니라 개인 판정 경로로 넘긴다."""
+    from src.agents.deterministic_info import _db_dc_comparison_response
+
+    for question in (
+        "근속 10년인데 DB 퇴직금 얼마 받나요",
+        "DB 3000만원 받았는데 세금은",
+    ):
+        assert _db_dc_comparison_response(question) is None, question
+
+
+def test_db_dc_comparison_declines_unrelated_questions():
+    """자기 소관이 아닌 질문에는 반드시 None을 낸다(CODE_OVERRIDABLE 안전 조건)."""
+    from src.agents.deterministic_info import _db_dc_comparison_response
+
+    for question in (
+        "오늘 점심 뭐 먹지",
+        "안정적인 연금 상품 추천해줘",
+        "세액공제 한도가 얼마인가요",
+        "디폴트옵션이 뭔가요",
+        "IRP 계좌 이전 절차 알려줘",
+    ):
+        assert _db_dc_comparison_response(question) is None, question
+
+
+# ── 계좌이전_절차 (실측 no.56/no.367: 근거 없이 "2013년 이전 가입분 이전 불가" 창작) ──
+
+
+def test_account_transfer_reaches_category_from_common_phrasings():
+    for question in (
+        "IRP 계좌를 다른 증권사로 옮기려면 어떻게 해야 하나요?",
+        "연금저축을 IRP로 이체할 수 있나요",
+        "퇴직연금 다른 회사로 옮기는 방법",
+        "연금저축 계좌를 해지하지 않고 다른 금융사로 옮기는 방법이 있나요?",
+    ):
+        assert "계좌이전_절차" in candidate_categories(question), question
+
+
+def test_account_transfer_answer_does_not_fabricate_2013_rule():
+    """근거에 없는 '2013년 이전 가입분은 이전 불가' 규정을 답변에 넣지 않는다.
+
+    실측 no.56: 2013.03.01은 실재하는 날짜이지만 완전히 다른 제도(연금수령연차
+    계산 시작점)에 관한 것이고 계좌 이전 가능 여부와는 무관하다.
+    """
+    draft, context = deterministic_response_for(
+        "계좌이전_절차", "IRP 계좌를 다른 증권사로 옮기려면 어떻게 해야 하나요?"
+    )
+
+    assert "2013" not in draft
+    assert "실물이전" in draft and "이체" in draft
+    assert context
+
+
+def test_account_transfer_declines_personal_judgment():
+    """본인 보유 상품 조건을 대입한 개별 판정은 다루지 않는다."""
+    from src.agents.deterministic_info import _account_transfer_procedure_response
+
+    assert _account_transfer_procedure_response("제가 보유한 MMF도 실물이전 되나요?") is None
+
+
+def test_account_transfer_declines_unrelated_questions():
+    from src.agents.deterministic_info import _account_transfer_procedure_response
+
+    for question in (
+        "오늘 점심 뭐 먹지",
+        "안정적인 연금 상품 추천해줘",
+        "세액공제 한도가 얼마인가요",
+        "디폴트옵션이 뭔가요",
+        "DC와 DB 차이가 뭔가요",
+        "중도인출 사유가 뭐가 있나요",
+    ):
+        assert _account_transfer_procedure_response(question) is None, question
+
+
+# ── 계좌선택_가이드 (실측 no.368: 근거 없이 "1,500만 원" 창작) ────────────────
+
+
+def test_account_choice_reaches_category_from_common_phrasings():
+    for question in (
+        "직장인이면 IRP만 만들어도 되나요, 연금저축도 같이 만들어야 하나요?",
+        "연금저축과 IRP 뭐가 다른가요",
+        "연금저축이랑 IRP 둘 다 필요한가요",
+    ):
+        assert "계좌선택_가이드" in candidate_categories(question), question
+
+
+def test_account_choice_answer_explains_withdrawal_flexibility():
+    """세액공제는 IRP 단독으로도 동일하고, 나눠 갖는 이유는 중도인출 유연성이다."""
+    draft, context = deterministic_response_for(
+        "계좌선택_가이드", "직장인이면 IRP만 만들어도 되나요, 연금저축도 같이 만들어야 하나요?"
+    )
+
+    assert "1,500만" not in draft   # 근거에 없는 창작 수치
+    assert "중도인출" in draft
+    assert context
+
+
+def test_account_choice_declines_personal_calculation():
+    """구체적인 개인 세액공제액 계산 요구는 다루지 않는다."""
+    from src.agents.deterministic_info import _account_choice_guide_response
+
+    assert _account_choice_guide_response("연금저축 600만원 납입했는데 얼마 공제되나요") is None
+
+
+def test_account_choice_declines_unrelated_questions():
+    from src.agents.deterministic_info import _account_choice_guide_response
+
+    for question in (
+        "오늘 점심 뭐 먹지",
+        "안정적인 연금 상품 추천해줘",
+        "세액공제 한도가 얼마인가요",
+        "디폴트옵션이 뭔가요",
+        "DC와 DB 차이가 뭔가요",
+        "IRP 계좌 다른 증권사로 옮기려면",
+    ):
+        assert _account_choice_guide_response(question) is None, question
+
+
+def test_retirement_benefit_tax_premise_gate_reaches_variants():
+    """Q3 변형은 세액공제/연금소득세 자유응답보다 전제검증 Gate가 우선 후보여야 한다."""
+    for question in (
+        "명퇴수당을 IRP에 넣으면 세금이 없어지나요?",
+        "퇴직금 3억을 IRP에 넣으면 세금이 얼마나 줄어요?",
+        "명퇴 교사인데 세금을 가장 적게 내는 방법만 알려줘.",
+        "명퇴수당은 연금계좌에 넣기만 하면 면세인가요?",
+        "퇴직금을 일시금으로 안 받으면 무조건 이득인가요?",
+        "IRP로 받으면 퇴직소득세가 사라지나요?",
+        "명예퇴직금을 연금으로 받으면 감면액이 얼마야?",
+    ):
+        assert "퇴직급여_연금계좌_세금전제검증" in candidate_categories(question), question
+
+
+def test_retirement_benefit_tax_premise_gate_blocks_unsafe_assumptions():
+    draft, context = deterministic_response_for(
+        "퇴직급여_연금계좌_세금전제검증",
+        "명퇴수당은 연금계좌에 넣기만 하면 면세인가요?",
+    )
+
+    assert "명퇴수당이라는 명칭만으로" in draft
+    assert "실제 지급 항목" in draft
+    assert "원천징수" in draft
+    assert "즉시 면세" in draft
+    assert "과세이연" in draft
+    assert "연금실제수령연차" in draft
+    assert "계산하지 않겠습니다" in draft
+    assert "다음 정보를 한 번에" in draft
+    assert "명퇴수당은 퇴직소득" not in draft
+    assert context
+    assert "calculation_allowed=false" in context[0]["content"]
+    assert "fund_source_status=unconfirmed" in context[0]["content"]

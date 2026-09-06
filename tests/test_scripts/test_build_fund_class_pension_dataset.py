@@ -8,11 +8,13 @@ from scripts.build_fund_class_pension_dataset import (
     apply_review_overrides,
     build_manifest,
     build_audit_rows,
+    canonical_rows,
     choose_cost_metric,
     compare_parser_to_reference,
     coverage_summary,
     normalize_class_code,
     p0_review_template_rows,
+    repo_relative_path,
     review_provenance_rows,
     review_template_rows,
     unresolved_p0_review_rows,
@@ -361,6 +363,36 @@ def test_review_override_can_restore_field_mismatch_row():
     assert canonical[0]["validation_status_before_review"] == "FIELD_MISMATCH"
 
 
+def test_canonical_rows_excludes_reference_blocked_extra_parser_rows():
+    parser_rows = [
+        {
+            "product_code": "KR000",
+            "class_code": "C",
+            "account_type": "퇴직연금/IRP",
+            "channel": "오프라인",
+            "total_expense_ratio": 0.02,
+            "source_file": "KR000.txt",
+        }
+    ]
+    validation_rows = [
+        {
+            "product_code": "KR000",
+            "class_code": "C",
+            "validation_status": "EXTRA_IN_PARSER",
+        }
+    ]
+    all_reference_rows = [
+        {
+            "product_code": "KR000",
+            "class_code": "C",
+            "account_type": "퇴직연금/IRP",
+            "cost_guard_usable": "N",
+        }
+    ]
+
+    assert canonical_rows(parser_rows, validation_rows, all_reference_rows) == []
+
+
 def test_review_provenance_reports_restored_rows():
     before = []
     after = [
@@ -492,3 +524,8 @@ def test_generated_coverage_artifact_matches_canonical_rows():
     assert coverage["lower_cost_pair_count"] > 0
     assert coverage["audit"]["audit_row_count"] > 0
     assert coverage["audit"]["audit_by_status_cause"]["FIELD_MISMATCH"]
+
+
+def test_review_override_path_is_repository_relative():
+    path = Path("data/processed/fund_class_pension_review.csv")
+    assert repo_relative_path(path) == "data/processed/fund_class_pension_review.csv"

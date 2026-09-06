@@ -4,7 +4,9 @@ think_trace를 포맷팅한다. HCX-005 사용.
 is_safe=False(①가드레일에서 차단된 경우)는 모델을 호출하지 않고 바로 정형 거절 응답을 만든다.
 """
 
+import re
 from datetime import date
+from decimal import Decimal, InvalidOperation
 
 from src.agents.context import dedupe_context, format_conversation_history, merge_drafts
 from src.agents.guardian import GUARD_HEADING
@@ -13,7 +15,10 @@ from src.agents.state import PensionAgentState
 from src.agents.verification import (
     enforce_missing_requirements,
     enforce_premise_issues,
+    enforce_unsupported_claims,
     enforce_unsupported_numbers,
+    correct_institution_terms,
+    has_general_guidance,
     replace_evidence_placeholders,
     split_premise_issues,
     strip_tool_call_artifacts,
@@ -77,6 +82,33 @@ _NODE_LABELS = {
 
 _WEEKDAYS_KR = ("월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일")
 
+_USER_EVIDENCE_HEADING = "📎 참고 근거"
+_INTERNAL_EVIDENCE_TOKENS = (
+    "Cost Guard canonical",
+    "dataset_version",
+    "dataset_status",
+    "extraction_note",
+    "review_status",
+    "FROZEN_V1",
+)
+_PRODUCT_CONTEXT_KEYS = (
+    "상품코드",
+    "클래스",
+    "계좌유형",
+    "판매채널",
+    "위험등급",
+    "유형",
+    "총보수·비용",
+    "합성총보수·비용",
+    "투자설명서효력발생일",
+    "시장잔고",
+    "잔고기준일",
+    "투자목적",
+    "투자전략",
+    "dataset_version",
+    "dataset_status",
+)
+
 
 def _today_context_line(today: date | None = None) -> str:
     """상대 날짜 해석용 작성 기준일을 프롬프트에만 넣는다."""
@@ -84,20 +116,172 @@ def _today_context_line(today: date | None = None) -> str:
     return f"{current.isoformat()} ({_WEEKDAYS_KR[current.weekday()]})"
 
 
+def _has_user_value(value: object) -> bool:
+    text = str(value or "").strip()
+    normalized = text.replace("%", "").strip()
+    return bool(text) and normalized not in {"None", "none", "null", "NULL", "없음", "nan"}
+
+
+def _parse_product_context(content: str) -> dict[str, str]:
+    key_pattern = "|".join(re.escape(key) for key in _PRODUCT_CONTEXT_KEYS)
+    pattern = re.compile(rf"(?:^|, )({key_pattern})=(.*?)(?=, (?:{key_pattern})=|$)")
+    return {match.group(1): match.group(2).strip() for match in pattern.finditer(content or "")}
+
+
+def _format_evidence_date(value: object) -> str:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if match:
+        return ".".join(match.groups())
+    return text
+
+
+def _clean_evidence_snippet(value: object, limit: int = 180) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text or any(token in text for token in _INTERNAL_EVIDENCE_TOKENS):
+        return ""
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _user_facing_source(source: object) -> str:
+    text = str(source or "").strip()
+    if text.startswith("Cost Guard canonical"):
+        return "파수꾼 검증 근거"
+    for token in _INTERNAL_EVIDENCE_TOKENS:
+        text = text.replace(token, "").strip()
+    return text or "근거 문서"
+
+
+def _product_document_title(source: object) -> str:
+    title = _user_facing_source(source)
+    title = re.sub(r"\s*\([^()]+\)\s*$", "", title).strip()
+    if "투자설명서" not in title:
+        title = f"{title} 투자설명서"
+    return title
+
+
+def _format_decimal_percent(value: str | Decimal) -> str:
+    decimal = value if isinstance(value, Decimal) else Decimal(str(value))
+    return f"{decimal:.2f}%"
+
+
+def _format_product_evidence_item(index: int, item: dict, fields: dict[str, str]) -> list[str]:
+    lines = [f"[{index}] {_product_document_title(item.get('source'))}"]
+
+    effective_date = fields.get("투자설명서효력발생일")
+    if _has_user_value(effective_date):
+        lines.append(f"- 효력발생일: {_format_evidence_date(effective_date)}")
+
+    used_items = [
+        label
+        for key, label in (
+            ("투자목적", "투자목적"),
+            ("투자전략", "투자전략"),
+            ("위험등급", "위험등급"),
+            ("총보수·비용", "총보수·비용"),
+            ("합성총보수·비용", "합성총보수·비용"),
+            ("시장잔고", "시장잔고"),
+        )
+        if _has_user_value(fields.get(key))
+    ]
+    if used_items:
+        lines.append(f"- 확인 항목: {', '.join(used_items)}")
+
+    snippets = []
+    for key in ("투자전략", "투자목적"):
+        snippet = _clean_evidence_snippet(fields.get(key))
+        if snippet:
+            snippets.append((key, snippet))
+    for label, snippet in snippets[:3]:
+        lines.append(f'- 핵심 원문({label}): "{snippet}"')
+    return lines
+
+
+def _format_cost_guard_evidence_item(index: int, item: dict) -> list[str]:
+    content = str(item.get("content") or "")
+    lines = [f"[{index}] 파수꾼 검증 근거", "- 동일 상품의 클래스별 총보수·비용 비교"]
+
+    pairs = re.findall(r"([A-Z](?:-[A-Z0-9]+)?)=([0-9]+(?:\.[0-9]+)?)%", content)
+    values: list[tuple[str, Decimal]] = []
+    for class_code, raw_value in pairs[:2]:
+        try:
+            value = Decimal(raw_value)
+        except InvalidOperation:
+            continue
+        values.append((class_code, value))
+        lines.append(f"- {class_code}: {_format_decimal_percent(value)}")
+
+    if len(values) >= 2:
+        diff = abs(values[0][1] - values[1][1])
+        lines.append(f"- 차이: {_format_decimal_percent(diff)}p")
+    return lines
+
+
+def _format_generic_evidence_item(index: int, item: dict) -> list[str]:
+    source = _user_facing_source(item.get("source"))
+    title, sep, section_from_source = source.partition(" — ")
+    lines = [f"[{index}] {title.strip() or source}"]
+
+    section = str(item.get("section") or section_from_source).strip()
+    if section:
+        lines.append(f"- 확인 항목: {section}")
+
+    content = str(item.get("content") or "").strip()
+    looks_like_json = content.startswith("{") or content.startswith("[{") or content.startswith("[[")
+    if not looks_like_json:
+        snippet = _clean_evidence_snippet(content)
+        if snippet:
+            lines.append(f'- 핵심 원문: "{snippet}"')
+    return lines
+
+
+def _format_user_evidence_block(context: list) -> str:
+    blocks = []
+    for item in dedupe_context(context):
+        source = str(item.get("source") or "")
+        content = str(item.get("content") or "")
+        if source.startswith("Cost Guard canonical") or item.get("node") == "guardian":
+            lines = _format_cost_guard_evidence_item(len(blocks) + 1, item)
+        else:
+            product_fields = _parse_product_context(content)
+            lines = (
+                _format_product_evidence_item(len(blocks) + 1, item, product_fields)
+                if product_fields
+                else _format_generic_evidence_item(len(blocks) + 1, item)
+            )
+        if lines:
+            blocks.append("\n".join(lines))
+
+    if blocks:
+        return f"{_USER_EVIDENCE_HEADING}\n\n" + "\n\n".join(blocks)
+
+    sources = [f"- {_user_facing_source(item.get('source'))}" for item in dedupe_context(context)]
+    return f"{_USER_EVIDENCE_HEADING}\n" + "\n".join(dict.fromkeys(sources))
+
+
 def _append_reference_line(answer: str, context: list) -> str:
     if not context:
         return answer
-    sources = "; ".join(dict.fromkeys(c["source"] for c in context))
-    if "참고 근거:" not in answer:
-        return f"{answer}\n\n참고 근거: {sources}"
+    clean_answer = _strip_reference_lines(_normalize_reference_heading(answer))
+    try:
+        evidence_block = _format_user_evidence_block(context)
+    except Exception:
+        sources = [f"- {_user_facing_source(c.get('source'))}" for c in context if c.get("source")]
+        evidence_block = f"{_USER_EVIDENCE_HEADING}\n" + "\n".join(dict.fromkeys(sources))
+    return f"{clean_answer}\n\n{evidence_block}"
 
-    head, sep, tail = answer.rpartition("참고 근거:")
-    existing = tail.strip()
-    missing = [source for source in dict.fromkeys(c["source"] for c in context) if source not in existing]
-    if not missing:
-        return answer
-    separator = "; " if existing else ""
-    return f"{head}{sep}{existing}{separator}{'; '.join(missing)}"
+
+def _normalize_reference_heading(answer: str) -> str:
+    return re.sub(r"\*\*\s*참고 근거\s*:\s*\*\*\s*", "참고 근거: ", answer or "")
+
+
+def _strip_reference_lines(answer: str) -> str:
+    lines = []
+    for line in (answer or "").splitlines():
+        if line.strip().startswith("참고 근거:"):
+            continue
+        lines.append(line)
+    return "\n".join(lines).rstrip()
 
 
 def _enforce_verification(
@@ -118,6 +302,7 @@ def _enforce_verification(
     """
     if not answer:
         return answer
+    answer = _normalize_reference_heading(answer)
 
     # ① 내부 인덱스 "[근거 1]"을 실제 출처명으로 치환 (요강: 모든 답변에 근거 문서 표시)
     answer = replace_evidence_placeholders(answer, context)
@@ -152,6 +337,12 @@ def _enforce_verification(
     confirmed_numbers = list(verification.get("unsupported_numbers_confirmed") or [])
     answer = enforce_unsupported_numbers(answer, confirmed_numbers)
 
+    # ③-2 수치가 아니라 **서술**로 근거 없이 단정한 부분에 한계를 고지한다.
+    # issues는 ④ 출력 중 유일하게 코드 강제가 없던 칸이었다(실측: grounded=False
+    # 46건 중 32건이 "확정 수치 없이 issues만" 있는 경우). 어느 문장인지 특정할 수
+    # 없어 삭제하지 않고 고지만 한다.
+    answer = enforce_unsupported_claims(answer, list(verification.get("issues") or []))
+
     # ④ 잘못된 전제를 바로잡지 않았으면 앞머리에 교정문을 붙인다 (요강: 정확성)
     answer = enforce_premise_issues(answer, premise_issues)
 
@@ -181,7 +372,7 @@ def _append_guardian_if_enabled(answer: str, guardian_result: dict | None) -> st
         return f"{answer}\n\n{block}"
 
     head, sep, tail = answer.rpartition("참고 근거:")
-    return f"{head.rstrip()}\n\n{block}\n\n{sep}{tail.strip()}"
+    return f"{head.rstrip()}\n\n{block}\n\n{sep} {tail.strip()}"
 
 
 def _finalize_answer(verified_core_answer: str, state: PensionAgentState, core_context: list) -> str:
@@ -194,6 +385,12 @@ def _finalize_answer(verified_core_answer: str, state: PensionAgentState, core_c
     # LLM이 도구 사용을 텍스트로 흉내내면(실측 V06) 그건 평범한 답변 문자열이라
     # grounded 검증(수치만 검사)도 enforce_*(덧붙이기만 함)도 걸러내지 못한다.
     answer = strip_tool_call_artifacts(verified_core_answer)
+    answer = _normalize_reference_heading(answer)
+    answer = _strip_reference_lines(answer)
+    # 제도명 영문 표기 오류 교정 (DC=Defined Contribution 등). 법령상 표기가 하나로
+    # 고정된 용어라 근거 확인 없이 치환해도 안전하다 — L0는 숫자만 보므로 이런
+    # 용어 오류를 구조적으로 잡지 못한다(실측 no.1 "DC(Dividend Contribution)형").
+    answer = correct_institution_terms(answer)
     answer = _append_guardian_if_enabled(answer, state.get("guardian_result"))
     return _append_reference_line(answer, [*core_context, *_guardian_context(state)])
 
@@ -214,6 +411,13 @@ def _classification_lines(state: PensionAgentState) -> list[str]:
     ]
     if state.get("scope_note"):
         lines.append(f"- 범위 판단: {state['scope_note']}")
+    # 정형 경로 누락 의심 — 판정에는 영향이 없고, 사후 집계로 어휘 커버리지 구멍을
+    # 찾기 위한 관측 신호다(deterministic_info.deterministic_miss_signal).
+    if state.get("deterministic_miss_signal"):
+        lines.append(
+            f"- ⚠️ 정형 경로 미탐지: 질문에 정형 주제어({state['deterministic_miss_signal']})가 "
+            "있으나 후보 카테고리 0건 — LLM 자유응답으로 진행"
+        )
     withdrawal_context = state.get("withdrawal_context") or {}
     locked_fields = withdrawal_context.get("locked_fields") or []
     if locked_fields:
@@ -337,7 +541,9 @@ def _verification_lines(state: PensionAgentState) -> list[str]:
     return lines
 
 
-def _assembly_lines(state: PensionAgentState, core_context: list, guardian_context: list) -> list[str]:
+def _assembly_lines(
+    state: PensionAgentState, core_context: list, guardian_context: list, answer: str = ""
+) -> list[str]:
     lines = ["[⑤ 최종 답변 조립]"]
     if core_context:
         sources = "; ".join(dict.fromkeys(c["source"] for c in core_context))
@@ -355,6 +561,14 @@ def _assembly_lines(state: PensionAgentState, core_context: list, guardian_conte
         lines.append("  - ③ LLM 초안을 폐기하고 폴백이 만든 상품 후보 답변으로 대체")
     if state.get("needs_clarification"):
         lines.append("  - 조건 불충분 → 첫 답변에 정보한계와 필요한 역질문 전체를 포함")
+        # 관측 전용 — 판정에는 영향이 없다. 프롬프트 지시("일반 기준을 먼저 쓰고
+        # 역질문은 그다음")가 실제로 지켜졌는지 사후 집계용으로 남긴다. 위반이어도
+        # 코드가 내용을 지어내 채우지 않는다(has_general_guidance 참고).
+        if answer and not has_general_guidance(answer):
+            lines.append(
+                "  - ⚠️ 역질문에 일반 기준 누락 의심: [추가 확인 필요] 앞부분이 짧음 — "
+                "프롬프트 지시(일반 기준을 먼저 제시) 미준수 가능성"
+            )
     if state.get("response_mode"):
         lines.append(f"  - 응답 모드: {state['response_mode']}")
     guardian_result = state.get("guardian_result") or {}
@@ -372,10 +586,14 @@ def _assembly_lines(state: PensionAgentState, core_context: list, guardian_conte
     return lines
 
 
-def _format_think_trace(state: PensionAgentState) -> str:
+def _format_think_trace(state: PensionAgentState, answer: str = "") -> str:
     """대회 평가 스키마의 think_trace — "사고·추론·도구 사용 과정"을 시간순 서사로 조립한다.
 
     추가 LLM 호출 없이 State에 이미 있는 값(①분류, tool_trace, ④검증 결과)만으로 만든다.
+
+    answer(최종 답변 텍스트, 선택)를 넘기면 역질문 답변에 일반 기준이 실제로
+    포함됐는지 관측 신호를 덧붙인다 — state["answer"]는 이 함수 호출 시점에
+    아직 채워지지 않았을 수 있어(반환 dict를 만드는 도중이라) 별도로 받는다.
     """
     core_context = dedupe_context(state.get("retrieved_context") or [])
     guardian_context = _guardian_context(state)
@@ -384,7 +602,7 @@ def _format_think_trace(state: PensionAgentState) -> str:
     lines.append(f"- 실행 계획: {_plan_sentence(state)}")
     lines.extend(_tool_trace_lines(state))
     lines.extend(_verification_lines(state))
-    lines.extend(_assembly_lines(state, core_context, guardian_context))
+    lines.extend(_assembly_lines(state, core_context, guardian_context, answer))
     lines.append("[참고: 근거 원문]")
     if context:
         lines.extend(f"  - [{c['source']}] {c['content']}" for c in context)
@@ -486,20 +704,22 @@ def build_generator_node():
                 context,
                 append_reference=False,
             )
+            final_answer = _finalize_answer(verified_answer, state, context)
             return {
-                "answer": _finalize_answer(verified_answer, state, context),
-                "think_trace": _format_think_trace(state),
+                "answer": final_answer,
+                "think_trace": _format_think_trace(state, final_answer),
             }
-        if state.get("recommendation_stage") == "type_recommendation":
+        if state.get("recommendation_stage") in ("type_recommendation", "specific_recommendation"):
             verified_answer = _enforce_verification(
                 draft,
                 verification,
                 context,
                 append_reference=False,
             )
+            final_answer = _finalize_answer(verified_answer, state, context)
             return {
-                "answer": _finalize_answer(verified_answer, state, context),
-                "think_trace": _format_think_trace(state),
+                "answer": final_answer,
+                "think_trace": _format_think_trace(state, final_answer),
             }
         if state.get("deterministic_info"):
             verified_answer = _enforce_verification(
@@ -508,9 +728,10 @@ def build_generator_node():
                 context,
                 append_reference=False,
             )
+            final_answer = _finalize_answer(verified_answer, state, context)
             return {
-                "answer": _finalize_answer(verified_answer, state, context),
-                "think_trace": _format_think_trace(state),
+                "answer": final_answer,
+                "think_trace": _format_think_trace(state, final_answer),
             }
 
         response = invoke_with_retry(llm, [
@@ -518,13 +739,14 @@ def build_generator_node():
             {"role": "user", "content": prompt},
         ])
 
+        final_answer = _finalize_answer(
+            _enforce_verification(response.content, verification, context, append_reference=False),
+            state,
+            context,
+        )
         return {
-            "answer": _finalize_answer(
-                _enforce_verification(response.content, verification, context, append_reference=False),
-                state,
-                context,
-            ),
-            "think_trace": _format_think_trace(state),
+            "answer": final_answer,
+            "think_trace": _format_think_trace(state, final_answer),
         }
 
     return generator_node

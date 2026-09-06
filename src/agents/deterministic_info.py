@@ -101,6 +101,8 @@ from src.agents.withdrawal_context import extract_withdrawal_context
 
 DeterministicCategory = Literal[
     "복합정보_태스크플랜",
+    "퇴직연금_유형비교",
+    "퇴직급여_연금계좌_세금전제검증",
     "세액공제_계산_입력부족",
     "세액공제_한도",
     "세금혜택_개요",
@@ -125,6 +127,8 @@ DeterministicCategory = Literal[
 # router.py가 프롬프트/RouterDecision의 Literal 정의에 그대로 재사용한다.
 DETERMINISTIC_CATEGORIES: tuple[str, ...] = (
     "복합정보_태스크플랜",
+    "퇴직연금_유형비교",
+    "퇴직급여_연금계좌_세금전제검증",
     "세액공제_계산_입력부족",
     "세액공제_한도",
     "세금혜택_개요",
@@ -169,7 +173,15 @@ DETERMINISTIC_CATEGORIES: tuple[str, ...] = (
 # deterministic_response_for가 후보 목록을 재확인하도록 고쳐 13개 전부 해결됐다.
 CODE_OVERRIDABLE_CATEGORIES: frozenset[str] = frozenset({
     "복합정보_태스크플랜",
+    "퇴직연금_유형비교",
+    "퇴직급여_연금계좌_세금전제검증",
     "개인세금_입력충분성",
+    # 개인 상황 신호가 있으면 스스로 None을 낸다(_DB_DC_PERSONAL_SIGNAL_MARKERS).
+    "제도비교_DB_DC",
+    # 이전/이체 요구가 없거나 개인 판정 신호가 있으면 스스로 None을 낸다.
+    "계좌이전_절차",
+    # 계좌 선택 신호가 없거나 개인 계산 요구가 있으면 스스로 None을 낸다.
+    "계좌선택_가이드",
     "중도인출_기한판정",
     "중도인출_요건판정",
     "실물이전_개별판정",
@@ -190,7 +202,68 @@ CODE_OVERRIDABLE_CATEGORIES: frozenset[str] = frozenset({
     # 라우터가 "얼마/한도" 형태가 아닌 질문("~받는 방법", "~많이 받고 싶은데")을
     # 기각하면서 답을 못 쓴 것이다. 핸들러가 스스로 None을 내므로 되살려도 안전하다.
     "세액공제_한도",
+    # ⚠️ 아래 세제 카테고리들은 TAX_FALLBACK_CATEGORIES와 한 쌍이다 — 후보가 0건이어도
+    # 되살릴 수 있게 열어둔다. 세제 질문은 표현이 무한한데 candidate_categories는 유한한
+    # 키워드 목록이라 누락이 반복됐고(퇴직금/1600만원/절세방법/납입한도…), 누락되면
+    # LLM 자유응답으로 새면서 2023년 개정 전 폐지 수치를 자신 있게 답한다.
+    # 오탐보다 누락이 훨씬 비싼 영역이라 판정을 넓게 열고, 안전은 "핸들러가 스스로
+    # None을 낸다"로 담보한다(세제 무관·인접 주제 질문 8종에 전부 None 확인).
+    # ⚠️ 세액공제_계산_입력부족은 일부러 넣지 않는다. 이 집합은 **후보가 있을 때의
+    # 첫 루프**에도 쓰이는데, 후보 순서상 이 카테고리가 세액공제_한도보다 앞이라
+    # 넣는 순간 "얼마나 넣어야 하나요?"류 질문이 한도 안내 대신 "입력값이 부족하다"는
+    # 계산 보류 답변으로 바뀐다(실측 회귀). 후보 0건일 때만 필요하므로
+    # TAX_FALLBACK_CATEGORIES에만 둔다.
+    "세금혜택_개요",
+    "연금수령한도",
+    "퇴직소득세감면",
+    "연금소득세_종합과세",
+    "연금소득세율_연령별",
 })
+
+
+# 후보가 0건이어도 라우터의 "해당없음"을 되살릴 수 있는 카테고리.
+#
+# candidate_categories는 "이 카테고리를 검토할 근거가 있다"를 키워드로 판정하는데,
+# 세제 영역에서 이 방식이 반복적으로 무너졌다 — 사용자는 제도 용어를 모른 채 일상어로
+# 묻기 때문이다("퇴직소득세" 대신 "퇴직금", "1,500만원 기준" 대신 본인 금액 "1,600만원",
+# "한도" 대신 "얼마나 넣어야"). 표현은 무한하고 키워드 목록은 유한해서 구조적으로 진다.
+#
+# 그래서 세제에 한해 순서를 뒤집는다: 키워드로 **차단**하지 않고, 라우터가 "해당없음"을
+# 냈을 때 세제 핸들러들에게 직접 물어본다. 핸들러가 답을 내면(= 자기 소관이면) 그걸
+# 쓰고, 전부 None이면 원래대로 LLM 경로로 간다. 잘 작동하는 다른 영역(중도인출·실물이전·
+# 디폴트옵션 등)은 건드리지 않는다 — 결함이 실측된 곳만 연다.
+#
+# ⚠️ 알려진 한계 (2026-09-03 실측으로 확인, 시도했다가 되돌림):
+# 이 폴백 루프는 **실제로는 발동하지 않는다**. deterministic_response_for가 내부에서
+# candidate_categories를 다시 확인하기 때문에(후보 게이트), 후보가 0건이면 무조건
+# None이 나온다.
+#
+# 그렇다고 게이트를 건너뛰는 우회로를 만들면 안 된다. 핸들러 대부분이 자기 소관을
+# 판단하지 못하기 때문이다 — 실측: "안정적인 연금 상품 추천해줘", "DB형과 DC형
+# 차이가 뭔가요"에 세액공제_한도·연금소득세율_연령별이 각각 한도표·세율표를 반환했다.
+# (기존 회귀 테스트 test_tax_fallback_does_not_hijack_non_tax_questions가 이를 잡는다.)
+# 즉 이 폴백이 지금까지 사고를 내지 않은 이유는 설계가 안전해서가 아니라 발동한 적이
+# 없어서다.
+#
+# 자기방어가 확인된 핸들러(개인세금·복합정보·중도인출 기한/요건·투자가능여부·
+# 퇴직시IRP)만 게이트 밖에서 부르는 안을 구현해 측정했으나, **501문항의 후보 0건
+# 177건 중 0건을 되살렸다.** 그 핸들러들이 내부적으로 candidate_categories와 같은
+# 키워드 판정을 쓰기 때문에, 키워드가 놓친 질문은 핸들러도 똑같이 놓친다.
+#
+# 결론: 후보 0건 문제는 이 계층에서 못 푼다. 키워드 판정 자체를 의미 기반으로
+# 바꾸거나(라우팅 구조 개편), 검색·검증 계층에서 방어해야 한다.
+TAX_FALLBACK_CATEGORIES: tuple[str, ...] = (
+    # 순서가 우선순위다. 좁고 구체적인 판정을 먼저 시도하고, 넓은 개요를 마지막에 둔다 —
+    # 개요가 먼저 오면 구체적 질문까지 일반론으로 덮어버린다.
+    "개인세금_입력충분성",
+    "세액공제_계산_입력부족",
+    "세액공제_한도",
+    "퇴직소득세감면",
+    "연금수령한도",
+    "연금소득세_종합과세",
+    "연금소득세율_연령별",
+    "세금혜택_개요",
+)
 
 
 # 한글로 나이를 말하는 표현 — "일흔 넘었는데", "칠순인데"처럼 숫자·'세' 없이 묻는 질문이
@@ -245,8 +318,40 @@ def candidate_categories(question: str) -> list[str]:
 
     if _build_composite_info_tasks(question):
         candidates.append("복합정보_태스크플랜")
+    if _asks_retirement_plan_comparison(question):
+        candidates.append("퇴직연금_유형비교")
+    if _asks_retirement_benefit_tax_premise_gate(question):
+        candidates.append("퇴직급여_연금계좌_세금전제검증")
     if personal_tax_response(question) is not None:
         candidates.append("개인세금_입력충분성")
+    # DB/DC 제도 비교 — 실측(no.1/no.27): 근거를 7건씩 갖고도 DB 급여 계산식을
+    # "평균 임금의 60% x 근속연수"로 창작했다. 여기서는 후보만 넓게 낸다 — 정밀
+    # 판정(개인 상황 배제 등)은 핸들러(_db_dc_comparison_response)가 담당한다.
+    # DB 단독 질문("DB형은 확정돼 있는 게 맞나요?")도 후보로 낸다 — DC 언급이
+    # 없어도 핸들러가 답할 수 있는 실측 사례(no.27)다.
+    mentions_db = "DB" in question or "확정급여" in text
+    mentions_dc = "DC" in question or "확정기여" in text
+    if mentions_db and mentions_dc:
+        candidates.append("제도비교_DB_DC")
+    elif mentions_db and _DB_CONFIRMATION_RE.search(text):
+        candidates.append("제도비교_DB_DC")
+    # 계좌 이전/이체 — 실측(no.56 "IRP 계좌를 다른 증권사로 옮기려면"): 근거 10건을
+    # 갖고도 무관한 규정("2013년 이전 가입분은 이전 불가")을 창작했다.
+    if any(word in text for word in ("IRP", "irp", "연금저축", "퇴직연금", "연금계좌")) and any(
+        word in text for word in ("이전", "옮기", "옮겨", "이체")
+    ):
+        candidates.append("계좌이전_절차")
+    # 계좌 선택 — 실측(no.368 "IRP만 만들어도 되나요, 연금저축도 같이 만들어야
+    # 하나요?"): 근거 없이 "1,500만 원"을 창작했다. 정답(세액공제 효과는 동일,
+    # 중도인출 유연성 때문에 나눠 갖는다)은 이미 문서에 있었다.
+    if any(word in text for word in ("연금저축", "IRP", "irp", "연금계좌")) and any(
+        word in text for word in (
+            "만들어야", "가입해야", "같이만들어야", "둘다", "나눠서", "나눠",
+            "어느게", "어떤게", "뭐가좋", "어느쪽이", "만해도", "만가입해도",
+            "뭐가달라", "뭐가다른", "차이가뭐", "차이가뭔",
+        )
+    ):
+        candidates.append("계좌선택_가이드")
     # ⚠️ "세액공제"라는 단어가 없어도 **납입 한도**를 묻는 질문은 같은 정형 답변이
     # 정답이다(_tax_credit_limit_response가 연금저축+IRP 합산 납입한도와 세액공제
     # 대상 한도를 함께 제시한다). 이 어휘를 빠뜨려서 생긴 구멍이 실측으로 확인됐다 —
@@ -258,28 +363,61 @@ def candidate_categories(question: str) -> list[str]:
     # 조금만 달라지면 무너진다")과 같은 클래스다. 정도부사("최대한 많이")가 원인이
     # 아니라는 점이 중요하다 — 부사를 빼도("연금저축이랑 IRP에 넣고 싶어요. 얼마까지
     # 되나요?") 여전히 후보가 0건이었다. 원인은 "넣다/납입"이라는 어휘 자체의 누락이다.
+    # ⚠️ _compact는 소문자화를 하지 않는다 — "IRP"(대문자)가 실제 표기라
+    # "irp"만 검사하면 영원히 안 걸린다. 두 표기를 함께 본다.
+    mentions_pension_account = any(
+        word in text for word in ("연금저축", "IRP", "irp", "연금계좌")
+    )
     asks_contribution_limit = (
         any(word in text for word in ("납입한도", "납입limit", "불입한도"))
         or (
-            # ⚠️ _compact는 소문자화를 하지 않는다 — "IRP"(대문자)가 실제 표기라
-            # "irp"만 검사하면 영원히 안 걸린다. 두 표기를 함께 본다.
-            any(word in text for word in ("연금저축", "IRP", "irp", "연금계좌"))
+            mentions_pension_account
             and any(word in text for word in ("넣", "납입", "불입", "저축", "가입", "얼마까지"))
             and any(word in text for word in ("얼마", "한도", "최대", "까지"))
+        )
+        # 한도를 **묻지 않고 단정**하는 형태도 같은 정형 답변이 정답이다.
+        # 실측 no.383("연금저축을 먼저 600만원 채우고 IRP로 300만원 추가하는 순서가
+        # 맞나요?")은 "얼마/한도" 어휘가 없어 후보 0건이 됐고, LLM이 "합산 한도는
+        # 연간 700만원"(폐지된 값)이라 답했다. 사용자가 한도를 이미 안다고 전제하고
+        # 확인만 구하는 질문일수록 틀린 전제를 바로잡아 줘야 하는데, 정작 그런
+        # 질문이 정형 경로에서 빠지고 있었다.
+        or (
+            mentions_pension_account
+            and re.search(r"\d[\d,]*\s*만\s*원", text) is not None
+            and any(word in text for word in ("맞나요", "맞는", "맞죠", "순서", "채우", "먼저", "나눠", "배분"))
         )
     )
     if "세액공제" in text or asks_contribution_limit:
         candidates.append("세액공제_계산_입력부족")
         candidates.append("세액공제_한도")
-    if any(word in text for word in ("세금혜택", "세제혜택", "절세혜택", "세금상혜택")) or (
-        "절세" in text and any(word in text for word in ("연금", "irp", "IRP", "개인사업자", "자영업"))
+    # ⚠️ "절세"가 연금 문맥 단어와 **동시에** 나오기를 요구하면, 사용자가 연금 상황을
+    # 다른 말로 표현한 순간 후보가 0건이 된다. 이 서비스는 연금 상담 전용이므로
+    # (범위 판정은 라우터의 scope가 따로 한다) "절세"라는 단어 자체가 이미 충분한
+    # 신호다. 동시출현 요구는 커버리지만 좁히고 얻는 것이 없다.
+    #
+    # 실측(2026-09-02, 실사용): "나는 올해 나이가 65세로 정년 은퇴를 앞두고 있어.
+    # 이런 내가 절세를 하고자하는데 방법 알려줘" -> 후보 0건.
+    # "은퇴/정년/65세"는 전부 연금 문맥인데 "연금/IRP"라는 단어가 없어서 걸러졌다.
+    # 그 결과 LLM 자유응답으로 흘러 "연간 최대 700만원까지 세액공제"(폐지된 한도)를
+    # 지어냈다. 정작 _tax_benefit_overview_response는 정답(600/900만원)뿐 아니라
+    # 사용자가 물은 이연퇴직소득세 감면(수령연차별 30/40/50%)까지 갖고 있었다.
+    # 같은 원인의 실측이 501문항에도 있었다 — no.383(700만원), no.321(700만원).
+    if any(word in text for word in ("세금혜택", "세제혜택", "절세혜택", "세금상혜택", "절세")) or (
+        "세금" in text and any(word in text for word in ("줄이", "아끼", "덜내", "덜 내", "혜택"))
     ):
         candidates.append("세금혜택_개요")
     # 사유별 기준일 용어("요양종료일", "잔금지급일" 등)는 그 자체로 중도인출 문맥을
     # 특정하므로, "중도인출"이라는 단어가 없어도 후보로 낸다. 실측 no.426
     # ("요양종료일이 2026년 12월 15일이면 신청기한이 다음해로 넘어가나요?")은 후보가
     # 0건이라 결정론 경로를 못 타고 LLM이 임의로 plan_type="DB"를 찍어 호출했다.
-    if "중도인출" in text or _mentions_withdrawal_basis_event(text):
+    # 제도 용어("중도인출")를 모르는 사용자는 "중간에 빼서 쓴다"처럼 풀어 쓴다.
+    asks_early_withdrawal_plainly = any(
+        word in text for word in ("중간에빼", "중간에찾", "미리빼", "미리찾", "중간인출")
+    ) or (
+        any(word in text for word in ("퇴직연금", "연금계좌", "IRP", "irp", "연금저축"))
+        and any(word in text for word in ("빼서쓸", "빼서쓰", "빼쓸", "꺼내쓸", "꺼내쓰"))
+    )
+    if "중도인출" in text or _mentions_withdrawal_basis_event(text) or asks_early_withdrawal_plainly:
         # 같은 도메인의 두 작업을 모두 후보로 낸다: 사유 목록 나열(중도인출_일반)과
         # 기한 계산·판정(중도인출_기한판정). 사유별로 후보 조건을 따로 쓰면
         # ("요양이고 요양종료일이 있으면...") 사유가 늘 때마다 조건이 늘고, 실제로
@@ -296,7 +434,10 @@ def candidate_categories(question: str) -> list[str]:
     # "1개 보유 중 같은 상품 추가매수 가능한가요?" 같은 옵트인 질문이 트리거 자체가
     # 없어 얼버무리거나 포기하는 답변만 나갔다). 두 작업을 모두 후보로 내고
     # 라우터가 질문 의도로 고르게 한다.
-    if any(word in text for word in ("디폴트옵션", "사전지정운용", "자동매수")):
+    # "자동매수"를 붙여 쓰지 않는 표현("자동으로 매수", "자동으로 사")도 같은 질문이다.
+    if any(word in text for word in ("디폴트옵션", "사전지정운용", "자동매수")) or (
+        "자동" in text and any(word in text for word in ("매수", "매입", "사지", "사는", "삽니"))
+    ):
         candidates.append("디폴트옵션_자동매수")
     if "옵트인" in text or (
         any(word in text for word in ("디폴트옵션", "사전지정운용"))
@@ -378,15 +519,60 @@ def candidate_categories(question: str) -> list[str]:
         or ("연금" in text and "55세" in text)
     ):
         candidates.append("연금수령한도")
-    if any(word in text for word in ("퇴직소득세", "이연퇴직소득세")):
+    # ⚠️ 제도 용어("퇴직소득세"/"이연퇴직소득세")만 요구하면, 일상어로 묻는 질문이
+    # 후보에조차 못 오른다 — 사용자는 "퇴직금"이라고 말하지 "이연퇴직소득"이라고 하지
+    # 않는다. 실측 "퇴직금 1억원을 연금으로 받으려고 해. 세금은?"은 후보가
+    # ['연금소득세율_연령별']뿐이라, **퇴직금 재원인데 사적연금소득 세율표(5.5/4.4/3.3%)**로
+    # 답하는 재원 혼동이 났다. 퇴직금 재원은 이연퇴직소득세 감면 체계라 세율 체계 자체가
+    # 다르므로, 재원을 잘못 잡으면 숫자가 통째로 틀린다.
+    #
+    # "퇴직금 + 연금수령 + 세금" 세 신호가 함께 있으면 이 카테고리가 맞다. 핸들러는
+    # 연차 정보가 없으면 스스로 None을 내므로(실측 확인) 과잉 확정 위험도 없다.
+    asks_retirement_pay_pension_tax = (
+        any(word in text for word in ("퇴직금", "퇴직급여", "명예퇴직금", "명퇴금"))
+        and any(word in text for word in ("연금으로", "연금수령", "연금으로받", "연금개시"))
+        and any(word in text for word in ("세금", "세율", "과세", "감면"))
+    )
+    # "연금실제수령연차"는 이 카테고리 고유의 개념어다(감면율 산정 전용 — 한도 산정용
+    # "연금수령연차"와 다른 값). 이 단어를 쓴 질문은 감면율을 묻는 것이 거의 확실한데
+    # 조건에 없어 후보에조차 못 올랐다(실측: "연금실제수령연차 5년차인데 퇴직금 세금
+    # 얼마나 감면돼?" -> 후보 ['개인세금_입력충분성']). 퇴직금 + 감면 조합도 같은 이유로
+    # 넣는다 — "연금으로"라는 표현 없이도 감면을 물으면 이 카테고리다.
+    asks_actual_receipt_year_reduction = "실제수령연차" in text or (
+        any(word in text for word in ("퇴직금", "퇴직급여", "명예퇴직금", "명퇴금"))
+        and "감면" in text
+    )
+    if (
+        any(word in text for word in ("퇴직소득세", "이연퇴직소득세"))
+        or asks_retirement_pay_pension_tax
+        or asks_actual_receipt_year_reduction
+    ):
         candidates.append("퇴직소득세감면")
     # ⚠️ "연금소득세"는 부분문자열 매칭이라 "연금소득세율"("세율" 부분)에도 걸린다.
     # 그러면 "연령별 연금소득세율 표 알려줘"가 종합과세로만 후보를 잡고 정작 아래
     # 연령별 세율 카테고리는 후보에서 빠지는 오발화가 생긴다(실측). "종합과세"·
     # "분리과세"는 그 자체로 명확한 단어라 문제없지만, "연금소득세"만 뒤에 "율"이
     # 붙지 않았는지 확인해 순수 종합과세 표현만 잡는다.
+    # 제도명 대신 **기준 금액**으로 묻는 표현이 흔하다("1500만원 넘으면 어떻게 되나요").
+    # 1,500만원은 사적연금소득 종합과세 판단 기준이라 이 금액 자체가 강한 신호다.
+    mentions_annual_threshold = any(
+        word in text for word in ("1500만", "1,500만", "1500만원", "천5백만", "1천5백만")
+    )
+    # ⚠️ 기준값(1,500만원) 자체를 말한 경우만 잡으면, 정작 **본인 연금소득 금액**을
+    # 말한 질문이 후보 0건이 된다 — 규칙이 발동하는 바로 그 상황인데도. 실측 CASE 8
+    # "연금소득이 1600만원이야"는 후보가 없어 LLM 자유응답으로 샜다(그 경로는 폐지된
+    # 수치를 지어내는 곳이라 통제 밖으로 나가는 것과 같다).
+    #
+    # 연금소득을 만원 단위 금액으로 말했으면 이 카테고리의 안내 대상이다. 핸들러는
+    # 기준과 판정 대상 재원만 설명하고 **사용자 금액이 과세대상인지는 단정하지 않으므로**
+    # (실측 확인) 금액을 잘못 확정할 위험이 없다.
+    states_pension_income_amount = ("연금소득" in text or "연금으로" in text) and re.search(
+        r"\d[\d,]*\s*만\s*원", text
+    ) is not None
     if any(word in text for word in ("종합과세", "분리과세")) or (
         "연금소득세" in text and "연금소득세율" not in text
+    ) or (mentions_annual_threshold and any(w in text for w in ("연금", "초과", "넘으면", "넘으"))) or (
+        states_pension_income_amount
     ):
         candidates.append("연금소득세_종합과세")
 
@@ -404,12 +590,54 @@ def candidate_categories(question: str) -> list[str]:
     # 없어 후보 0건이 되고, 라우터가 맞게 판정해도 _enforce_candidate_scope가 되돌렸다.
     has_tax_context = any(word in text for word in _TAX_AMOUNT_WORDS)
     has_receipt_context = any(word in text for word in _PENSION_RECEIPT_WORDS)
-    if "연령별" in text or (
+    # "연금소득세율"은 이 카테고리를 글자 그대로 지목하는 이름이다. 나이·수령 문맥을
+    # 추가로 요구하면 정작 가장 직접적인 질문("연금소득세율 알려줘")이 후보 0건이 된다
+    # — 이 함수가 반복해서 겪은 "표면 어휘 조합" 실패와 같은 형태다.
+    # 핸들러는 나이를 못 찾으면 연령별 세율표 전체를 안내하므로 되살려도 안전하다.
+    if "연금소득세율" in text or "연령별" in text or (
         has_tax_context and (_AGE_MENTION_RE.search(text) or has_receipt_context)
     ):
         candidates.append("연금소득세율_연령별")
 
     return candidates
+
+
+# ── 정형 경로 누락 관측 (silent miss) ────────────────────────────────────────
+#
+# candidate_categories의 실패는 **조용하다**. 후보가 0건이 되면 아무 신호 없이 LLM
+# 자유응답으로 넘어가고, 틀린 답이 나가야만 비로소 발견된다. 실제로 같은 유형이
+# 세 번 재발했다:
+#   - no.383/no.321  "연금저축 600만원 채우고 IRP 300만원" → 700만원(폐지된 한도)
+#   - V03/V05        "세액공제 대박으로 받는 방법"          → 700만원/400만원/14.6%
+#   - 실사용(65세)    "정년 은퇴 앞두고 절세 방법"           → 700만원
+# 셋 다 정답을 가진 핸들러가 있었는데 어휘 조건이 좁아 도달하지 못한 것이다.
+#
+# 오탐(넓게 잡음)은 라우터와 deterministic_response_for 게이트가 걸러내지만,
+# **누락은 아무도 막지 못한다** — 이 비대칭이 문제의 핵심이다. 그래서 누락을
+# 최소한 "보이게" 만든다: 정형 주제어가 있는데 후보가 0건이면 신호를 남긴다.
+#
+# 이 함수는 판정을 바꾸지 않는다(후보를 추가하지도, 빼지도 않는다). 오직 관측용이다 —
+# think_trace와 평가 로그에 남겨, 다음 누락을 "터진 뒤"가 아니라 집계로 발견한다.
+_DETERMINISTIC_TOPIC_MARKERS = (
+    "DB", "DC", "확정급여", "확정기여",
+    "세액공제", "절세", "세금혜택", "세제혜택", "연금소득세", "퇴직소득세", "기타소득세",
+    "중도인출", "실물이전", "디폴트옵션", "연금수령한도", "위험자산", "종합과세",
+    "납입한도", "세율", "과세",
+)
+
+
+def deterministic_miss_signal(question: str) -> Optional[str]:
+    """정형 주제어가 있는데 후보가 0건이면 그 주제어를 돌려준다 (없으면 None).
+
+    "정형 답변이 있어야 할 것 같은데 경로가 없다"는 의심 신호다. 확정된 결함이
+    아니라 **점검 대상**이라는 뜻이다 — 정형 카테고리가 아직 없는 주제(DB/DC 운용주체
+    차이 등)도 여기 걸리므로, 이 신호가 곧 버그를 의미하지는 않는다.
+    """
+    if candidate_categories(question):
+        return None
+    text = _compact(question)
+    hit = [marker for marker in _DETERMINISTIC_TOPIC_MARKERS if marker in text]
+    return ", ".join(hit) if hit else None
 
 
 def deterministic_response_for(
@@ -514,6 +742,144 @@ def _context(source: str, content: str) -> list[RetrievedItem]:
     return [{"source": source, "content": content, "node": "info_agent"}]
 
 
+_RETIREMENT_PLAN_COMPARISON_SOURCES = (
+    "퇴직연금 가입대상 doc10_chunk02/03",
+    "퇴직연금제도 기본 doc11_chunk01_part1/2",
+    "DB DC 퇴직연금 산정 doc15_chunk01_part1/doc15_chunk02",
+)
+_RETIREMENT_PLAN_FACT_VERSION = "2026-08-13-chroma-docs"
+
+
+def _asks_retirement_plan_comparison(question: str) -> bool:
+    """DB/DC/퇴직금 핵심 비교 질문만 Fact Contract 후보로 올린다."""
+    text = _compact(question)
+    upper = text.upper()
+    has_db = "DB" in upper or "확정급여" in text or "DEFINEDBENEFIT" in upper
+    has_dc = "DC" in upper or "확정기여" in text or "DEFINEDCONTRIBUTION" in upper
+    if has_db and has_dc:
+        return any(
+            word in text
+            for word in (
+                "차이", "비교", "다른", "달라", "누가", "운용", "굴려", "계산", "산식",
+                "정해", "확정", "책임", "부담", "손실", "수익", "퇴직금", "퇴직급여",
+            )
+        ) or "DEFINED" in upper
+
+    plan_context = "퇴직금" in text or "퇴직급여" in text or "퇴직연금" in text
+    if not ((has_db or has_dc) and plan_context):
+        return False
+    return any(
+        word in text
+        for word in (
+            "미리정", "사전에정", "확정", "운용", "손실", "책임", "부담", "계산", "산식", "달라",
+        )
+    )
+
+
+def _retirement_plan_comparison_response(_question: str) -> tuple[str, list[RetrievedItem]]:
+    """DB/DC/퇴직금 비교의 불변 사실만 근거 포함 Fact Contract로 고정한다."""
+    source = "; ".join(_RETIREMENT_PLAN_COMPARISON_SOURCES)
+    content = (
+        f"version={_RETIREMENT_PLAN_FACT_VERSION}; "
+        "plan_type=DB; english_name=Defined Benefit; operator=회사; "
+        "benefit_formula=평균임금 x 계속근로기간 또는 퇴직 전 평균임금 30일분 x 계속근로기간; "
+        "contribution_rule=급여 지급능력 확보를 위한 적립; investment_result_bearer=회사; "
+        "benefit_variability=근로자 급여는 사전에 정해진 수준을 기준으로 함; "
+        "source_id=doc10_chunk02,doc11_chunk01_part1,doc15_chunk01_part1. "
+        "plan_type=DC; english_name=Defined Contribution; operator=근로자; "
+        "benefit_formula=기여금 또는 부담금 누계액 + 운용손익; "
+        "contribution_rule=회사가 연간 임금총액의 1/12 이상을 근로자 계정에 납입; "
+        "investment_result_bearer=근로자; benefit_variability=운용 성과에 따라 최종 퇴직급여가 달라짐; "
+        "source_id=doc10_chunk03,doc11_chunk01_part2,doc15_chunk02. "
+        "퇴직금제도는 퇴직 시 회사가 퇴직급여를 지급하고, 퇴직연금은 퇴직 전 금융기관에 적립해 "
+        "퇴직 시 금융기관에서 지급합니다; source_id=doc11_chunk01_part1."
+    )
+    draft = (
+        "DB와 DC는 이름부터 확정되는 대상이 다릅니다.\n\n"
+        "| 구분 | DB형 | DC형 |\n"
+        "|---|---|---|\n"
+        "| 영문명 | DB(Defined Benefit, 확정급여형) | DC(Defined Contribution, 확정기여형) |\n"
+        "| 운용 주체 | 회사가 적립금을 운용 | 근로자가 직접 운용 |\n"
+        "| 정해지는 것 | 퇴직 시 받을 급여 수준 | 회사가 납입할 부담금 수준 |\n"
+        "| 산식 | 평균임금 x 계속근로기간 또는 퇴직 전 평균임금 30일분 x 계속근로기간 | 기여금/부담금 누계액 + 운용손익 |\n"
+        "| 회사 부담금 기준 | 정해진 급여 지급능력을 확보하도록 적립 | 연간 임금총액의 1/12 이상 |\n"
+        "| 운용손익 영향 | 회사가 운용성과 부담 | 근로자의 최종 수령액에 반영 |\n\n"
+        "따라서 DC형은 회사가 최종 퇴직금을 미리 정해주는 제도가 아니라, 회사가 정해진 부담금을 넣고 "
+        "그 이후 운용 결과가 근로자 수령액에 반영되는 구조입니다. 반대로 DB형은 근로자가 직접 상품을 "
+        "골라 운용성과를 부담하는 구조가 아니라, 회사가 운용하고 약속된 급여 수준을 맞추는 구조입니다.\n\n"
+        "일반 퇴직금제도와 퇴직연금제도도 구분해야 합니다. 퇴직금제도는 근로자 퇴직 시 회사가 퇴직급여를 "
+        "지급하는 방식이고, 퇴직연금제도는 퇴직 전에 금융기관에 재원을 적립해 두었다가 퇴직 시 금융기관을 "
+        "통해 지급하는 방식입니다."
+    )
+    return draft, _context(source, content)
+
+
+def _asks_retirement_benefit_tax_premise_gate(question: str) -> bool:
+    """퇴직급여/명퇴수당을 연금계좌에 넣을 때의 성급한 세금 단정을 잡는다."""
+    text = _compact(question)
+    benefit_terms = (
+        "명퇴수당", "명퇴금", "명예퇴직금", "명퇴", "퇴직금", "퇴직급여", "퇴직소득세", "이연퇴직소득세"
+    )
+    has_benefit = any(term in text for term in benefit_terms)
+    has_account_or_receipt = any(
+        term in text
+        for term in ("IRP", "irp", "연금계좌", "연금으로", "연금수령", "일시금", "연금외", "인출")
+    )
+    has_tax_question = any(
+        term in text
+        for term in (
+            "세금", "과세", "면세", "절세", "감면", "세율", "없어", "사라지", "줄어",
+            "적게", "이득", "유리", "얼마", "무조건", "어마어마",
+        )
+    )
+    if has_benefit and has_tax_question and (has_account_or_receipt or "퇴직소득세" in text or "명퇴" in text):
+        return True
+    return "퇴직소득세" in text and has_account_or_receipt and has_tax_question
+
+
+def _retirement_benefit_tax_premise_gate_response(question: str) -> tuple[str, list[RetrievedItem]]:
+    r1 = get_deferred_retirement_tax_rate(1)
+    r11 = get_deferred_retirement_tax_rate(11)
+    r21 = get_deferred_retirement_tax_rate(21)
+    source = "doc39~doc40 이연퇴직소득세 감면 규칙; 퇴직연금제도 기본 — 개인형 퇴직연금제도(IRP)"
+    content = (
+        "premise_status=requires_correction; fund_source_status=unconfirmed; "
+        "calculation_allowed=false; "
+        "required_explanations=명퇴수당 명칭만으로 세법상 재원 확정 금지, IRP/연금계좌 입금과 즉시 면세 구분, "
+        "퇴직소득 재원으로 확인되는 경우 과세이연 및 연금실제수령연차별 이연퇴직소득세 감면 설명; "
+        f"reduction_rule=1~10년차 {_pct(r1.reduction_ratio)} 감면, 11~20년차 {_pct(r11.reduction_ratio)} 감면, "
+        f"21년차 이상 {_pct(r21.reduction_ratio)} 감면; "
+        "missing_fields=실제 지급 항목, 원천징수 내역, 세법상 재원, 수령방식, 연금실제수령연차, 원래 부과될 이연퇴직소득세; "
+        "source_ids=doc39,doc40,퇴직연금제도 기본 IRP"
+    )
+    exaggerated = any(word in _compact(question) for word in ("어마어마", "무조건", "면세", "없어", "사라지"))
+    premise_line = (
+        "먼저, 세금이 크게 줄거나 사라진다는 전제는 그대로 인정하면 안 됩니다. "
+        if exaggerated
+        else ""
+    )
+    draft = (
+        f"{premise_line}명퇴수당이라는 명칭만으로 그 돈이 세법상 어떤 재원인지, 또는 IRP 이전 가능한 "
+        "퇴직소득 재원인지 자동 확정할 수 없습니다. 실제 지급 항목의 성격과 원천징수 내역을 먼저 "
+        "확인해야 합니다.\n\n"
+        "확정적으로 안내할 수 있는 원칙은 다음과 같습니다.\n"
+        "- 연금계좌나 IRP에 넣는 것 자체가 즉시 면세를 뜻하지는 않습니다.\n"
+        "- 퇴직소득 재원으로 확인되는 금액을 연금계좌에서 연금으로 수령하면, 과세이연과 "
+        "연금실제수령연차별 이연퇴직소득세 감면을 검토할 수 있습니다.\n"
+        f"- 감면 구조는 연금실제수령연차 1~10년차 {_pct(r1.reduction_ratio)}, "
+        f"11~20년차 {_pct(r11.reduction_ratio)}, 21년차 이상 {_pct(r21.reduction_ratio)} 감면입니다.\n"
+        "- 연금외수령이나 바로 인출하는 경우에는 연금수령 감면이 적용되지 않을 수 있으므로, "
+        "일시금과 연금수령을 무조건적인 유불리로 단정하면 안 됩니다.\n\n"
+        "현재 질문만으로는 구체적인 절세액을 계산하지 않겠습니다. 다음 정보를 한 번에 알려주세요.\n"
+        "1. 지급명세서상 실제 지급 항목명과 원천징수 내역은 어떻게 표시되어 있나요?\n"
+        "2. 해당 금액이 퇴직소득, 근로소득, 기타소득 등 어떤 재원으로 처리됐나요?\n"
+        "3. IRP 또는 연금계좌로 이전한 뒤 연금으로 받을 예정인가요, 일시금/중도인출로 받을 예정인가요?\n"
+        "4. 퇴직소득 재원이라면 연금실제수령연차가 몇 년차인가요?\n"
+        "5. 원래 부과될 이연퇴직소득세 금액 또는 원천징수된 세액은 얼마인가요?"
+    )
+    return draft, _context(source, content)
+
+
 # 한글 숫자 단위. "6천만원"처럼 아라비아 숫자와 만원 사이에 "천"이 끼는 표기를
 # 처리하기 위해 "천/백/십" 보조단위까지 인식한다. "만"·"억"은 필수 뒤 단위이고
 # "천/백/십"은 그 앞에 선택적으로 붙는 보조단위다 (예: 6천만 = 6*1000*10000).
@@ -584,12 +950,38 @@ def _extract_labeled_amount(question: str, labels: tuple[str, ...]) -> int | Non
         if before and not _AMOUNT_BOUNDARY_BREAK_RE.search(before.group(2)):
             amount = _amount_from_match(before.group(1))
             return amount * 12 if _is_monthly_amount(compact, before.start(1)) else amount
+
+        bare_after = re.search(rf"{escaped}([^\d-]{{0,8}})({_BARE_AMOUNT_RE})(?!\s*(?:만|억|원))", compact, re.IGNORECASE)
+        if bare_after and not _AMOUNT_BOUNDARY_BREAK_RE.search(bare_after.group(1)):
+            amount = _parse_bare_manwon_amount(bare_after.group(2))
+            if amount is not None:
+                return amount * 12 if _is_monthly_amount(compact, bare_after.start(2)) else amount
     return None
 
 
 def _amount_from_match(amount_text: str) -> int:
     m = re.match(rf"({_AMOUNT_NUMBER_RE})\s*({_AMOUNT_UNIT_RE})", amount_text)
     return _parse_korean_amount(m.group(1), m.group(2))
+
+
+_BARE_AMOUNT_RE = r"-?\d[\d,]*(?:\.\d+)?"
+
+
+def _has_negative_labeled_amount(question: str) -> bool:
+    compact = _compact(question)
+    labels = ("연금저축", "연저", "IRP", "irp", "개인형IRP", "개인형퇴직연금", "총급여", "급여", "연봉", "종합소득")
+    for label in labels:
+        if re.search(rf"{re.escape(label)}[^\d-]{{0,12}}-\d", compact, re.IGNORECASE):
+            return True
+    return False
+
+
+def _parse_bare_manwon_amount(number_text: str) -> int | None:
+    value = float(number_text.replace(",", ""))
+    if value < 0:
+        return None
+    # 라벨 바로 뒤 단위 없는 숫자는 평가셋 표현상 만원 단위로 쓰인다.
+    return int(value * 10_000)
 
 
 def extract_tax_credit_inputs(question: str) -> dict[str, int | None]:
@@ -607,8 +999,98 @@ def _has_sufficient_tax_credit_inputs(values: dict[str, int | None]) -> bool:
     return has_contribution and has_income
 
 
+# "전부/모두 공제되나요", "OOO만원 기준으로 계산되나요" 처럼 **한도 이내인지**만 묻는
+# 질문은 소득 정보 없이도 답이 확정된다("네/아니요 + 한도까지만"). 그런데 이 질문은
+# 납입액이 있으므로 candidate_categories가 세액공제_계산_입력부족도 항상 후보로
+# 올리고, 라우터가 그쪽을 확정하면 소득을 요구하며 역질문한다.
+#
+# 실측(2026-09-06, 501문항): no.75("IRP 1000만원, 900만원 기준으로 계산되나요?")와
+# no.312("연금저축 601만원 넣었는데 전부 세액공제 되나요?")가 이 결함으로 역질문
+# 됐다 — 둘 다 baseline에서는 정답(한도까지만 공제)이 나갔었다. 이 판정을
+# 세액공제_한도 핸들러 안에만 두면 세액공제_계산_입력부족으로 확정되는 경우 여전히
+# 뚫린다 — _has_sufficient_tax_credit_inputs와 같은 이유로, 카테고리 분류 결과와
+# 무관하게 양쪽 핸들러 진입 시점에 먼저 확인해야 한다.
+def _tax_credit_limit_only_question_response(
+    question: str, values: dict[str, int | None], source: str, content: str
+) -> tuple[str, list[RetrievedItem]] | None:
+    """한도 이내 여부만 확인하면 되는 질문이면 답을 확정하고, 아니면 None을 반환한다."""
+    if values["total_salary"] is not None or values["comprehensive_income"] is not None:
+        return None  # 소득까지 주어졌으면 정확한 계산 경로(호출자)에 맡긴다
+
+    pension_savings_paid = values["pension_savings_paid"]
+    irp_paid = values["irp_paid"]
+
+    # 연금저축 단독 납입 — "전부/모두 공제되나요" 류
+    asks_all_credited = any(word in _compact(question) for word in ("전부", "모두", "다세액공제", "전체"))
+    if pension_savings_paid and irp_paid is None and asks_all_credited:
+        credited = min(pension_savings_paid, PENSION_SAVINGS_ONLY_LIMIT)
+        excess = max(0, pension_savings_paid - PENSION_SAVINGS_ONLY_LIMIT)
+        if excess:
+            draft = (
+                f"아니요. 연금저축에 {_won(pension_savings_paid)}을 납입했더라도, **연금저축만으로는 "
+                f"{_won(PENSION_SAVINGS_ONLY_LIMIT)}까지만 세액공제 대상**입니다.\n\n"
+                f"- 세액공제 대상 연금저축 납입액: {_won(credited)}\n"
+                f"- 연금저축 단독 한도를 넘는 금액: {_won(excess)}\n\n"
+                f"연금저축과 IRP를 함께 활용하면 두 계좌 합산으로 {_won(COMBINED_CREDIT_LIMIT)}까지 "
+                "세액공제 대상이 될 수 있지만, 연금저축 단독 한도 자체가 900만원으로 늘어나는 구조는 아닙니다.\n\n"
+                "세액공제율은 소득 기준에 따라 16.5% 또는 13.2%가 적용됩니다."
+            )
+            return draft, _context(source, content)
+
+    # IRP 단독(또는 연금저축+IRP 합산) 납입 — "OOO만원 기준으로 계산되나요" 류.
+    # no.75: "IRP에만 1000만원 넣었는데 900만원 기준으로 계산되나요?" — 합산한도
+    # 이내에 있는지만 물었으므로 소득 없이도 답이 확정된다.
+    combined_paid = (pension_savings_paid or 0) + (irp_paid or 0)
+    asks_basis_confirmation = bool(
+        re.search(r"기준으로\s*계산", _compact(question))
+        or re.search(r"기준(?:이|으로)?\s*(?:되나요|맞나요|인가요)", _compact(question))
+    )
+    if irp_paid and asks_basis_confirmation:
+        credited = min(combined_paid, COMBINED_CREDIT_LIMIT)
+        excess = max(0, combined_paid - COMBINED_CREDIT_LIMIT)
+        if excess:
+            intro = (
+                f"네. 합산 납입액 {_won(combined_paid)}이 연금저축+IRP 합산 세액공제 대상 한도 "
+                f"{_won(COMBINED_CREDIT_LIMIT)}을 넘으므로, {_won(COMBINED_CREDIT_LIMIT)}까지만 "
+                "세액공제 대상 납입액으로 계산됩니다."
+            )
+        else:
+            intro = (
+                f"네. 연금저축+IRP 합산 세액공제 대상 한도는 {_won(COMBINED_CREDIT_LIMIT)}이고 "
+                f"합산 납입액 {_won(combined_paid)}이 그 이내이므로, {_won(credited)} 전액이 "
+                "세액공제 대상 납입액으로 계산됩니다."
+            )
+        draft = (
+            intro + "\n\n"
+            f"- 세액공제 대상 납입액: {_won(credited)}\n"
+            + (f"- 한도를 넘는 금액(공제 대상 제외): {_won(excess)}\n" if excess else "")
+            + "\n세액공제율은 소득 기준(총급여 또는 종합소득금액)에 따라 16.5% 또는 13.2%가 "
+            "적용되며, 정확한 공제액은 소득을 알려주시면 계산해 드립니다."
+        )
+        return draft, _context(source, content)
+
+    return None
+
+
 def _tax_credit_calculation_missing_response(question: str) -> tuple[str, list[RetrievedItem]]:
     source = "doc41 세액공제 계산 입력값 규칙"
+    if _has_negative_labeled_amount(question):
+        content = (
+            "calculation_allowed=false; negative_amount_detected=true; "
+            "세액공제 계산 입력값은 실제 연간 납입액과 소득금액이어야 하며, 음수 납입액 또는 음수 소득금액은 "
+            "계산 입력으로 사용할 수 없습니다. 세액공제액 계산에는 연금저축 납입액, IRP 납입액, "
+            "총급여 또는 종합소득금액이 필요합니다."
+        )
+        draft = (
+            "입력값 중 음수 금액이 있어 세액공제액을 계산하지 않겠습니다.\n\n"
+            "세액공제 계산에는 실제 연간 납입액과 소득금액을 0원 이상 금액으로 입력해야 합니다. "
+            "정확한 계산을 위해 다음 정보를 한 번에 알려주세요.\n"
+            "1. 올해 연금저축에 실제 납입한 금액은 얼마인가요?\n"
+            "2. 올해 IRP에 실제 납입한 금액은 얼마인가요?\n"
+            "3. 직장인이라면 총급여, 개인사업자라면 종합소득금액은 얼마인가요?"
+        )
+        return draft, _context(source, content)
+
     values = extract_tax_credit_inputs(question)
     if _has_sufficient_tax_credit_inputs(values):
         pension_savings_paid = values["pension_savings_paid"] or 0
@@ -681,6 +1163,13 @@ def _tax_credit_calculation_missing_response(question: str) -> tuple[str, list[R
         f"{_won(INCOME_THRESHOLD_COMPREHENSIVE)} 이하이면 {_pct(CREDIT_RATE_LOW)}, "
         f"초과이면 {_pct(CREDIT_RATE_HIGH)}입니다."
     )
+
+    # 소득 없이도 한도 이내 여부만으로 답이 확정되는 질문("전부 공제되나요" /
+    # "OOO만원 기준으로 계산되나요")이면, 소득을 요구하는 역질문 대신 바로 답한다.
+    limit_only = _tax_credit_limit_only_question_response(question, values, source, content)
+    if limit_only is not None:
+        return limit_only
+
     draft = (
         "세액공제 금액은 납입액과 소득구간이 함께 있어야 계산할 수 있습니다.\n\n"
         "현재 질문에는 실제 계산에 필요한 입력값이 부족하므로, 세액공제액을 임의로 산출하지 않겠습니다.\n\n"
@@ -695,6 +1184,214 @@ def _tax_credit_calculation_missing_response(question: str) -> tuple[str, list[R
         "4. 이미 회사 DC/IRP 추가납입 등 다른 연금계좌 납입액이 있다면 함께 알려주세요."
     )
     return draft, _context(source, content)
+
+
+# DB(확정급여형) 급여 계산식. 실측(no.1/no.27): LLM이 "평균 임금의 60% x 근속연수"라는
+# 근거에 없는 계산식을 지어냈다. 정답은 "퇴직 전 평균임금 30일분 x 계속근로기간"이다.
+_DB_DC_COMPARISON_SOURCE = "DB DC 퇴직연금 산정 / 퇴직연금 가입대상 / 퇴직연금제도 기본"
+_DB_DC_COMPARISON_CONTENT = (
+    "퇴직연금제도는 확정급여형(DB, Defined Benefit)과 확정기여형(DC, Defined Contribution) "
+    "두 가지로 나뉜다.\n\n"
+    "확정급여형(DB): 근로자가 퇴직 시 받을 금액이 사전에 확정되어 있으며, 회사가 적립금을 "
+    "운용한다. DB형 급여 계산식은 '퇴직 전 평균임금 30일분 x 계속근로기간'이다. "
+    "평균임금 1일분은 퇴직 전 3개월간 지급된 임금 총액을 해당 기간의 총 일수로 나누어 "
+    "산정한다.\n\n"
+    "확정기여형(DC): 회사가 매년 일정 금액을 근로자의 계좌에 입금하고, 근로자가 직접 운용하여 "
+    "수익률에 따라 최종 퇴직금이 달라진다. DC는 가입자 명부를 근거로 가입자 본인 명의의 "
+    "실계좌가 개설되어 온라인 상품매매 등이 가능하다.\n\n"
+    "제도 변경: 퇴직연금(DB)에서 퇴직연금(DC)으로는 변경할 수 있으나, 퇴직연금(DC)에서 "
+    "퇴직연금(DB)으로는 변경할 수 없다."
+)
+
+# 구체적인 개인 계산을 요구하는 신호. "제가/저는"만으로는 판단하지 않는다 —
+# "DB형은 제가 받을 퇴직금이 미리 확정돼 있는 게 맞나요?"(no.27)처럼 1인칭이지만
+# 제도 사실을 묻는 질문이 흔해서, 그것까지 걸러내면 실측 사례를 놓친다. 실제 계산을
+# 요구하는 신호(숫자 제시, "계산해줘")만 개인 판정으로 넘긴다.
+_DB_DC_CALCULATION_SIGNAL_MARKERS = ("계산해", "계산해줘", "얼마나되나요", "얼마받나요", "얼마입니까")
+_NUMBER_PRESENT_RE = re.compile(r"\d")
+
+# DB형이 "확정된 금액을 준다"는 사실을 확인하는 질문. 어미 활용형을 일일이 나열하면
+# 실측 no.10처럼 놓친 표현이 반드시 나온다("확정돼있는" 목록엔 "확정된 금액을 받는
+# 거"가 없었다) — "확정"이라는 어간과 질문형 종결(맞나요/인가요/나요/까요)이
+# 둘 다 있는지를 정규식으로 본다. 사이에 어떤 말이 와도(받는, 인, 되는 등) 잡힌다.
+_DB_CONFIRMATION_RE = re.compile(r"확정.{0,12}(맞나요|맞는지|맞습니까|인가요|나요|까요\?)")
+
+
+def _db_dc_comparison_response(question: str) -> tuple[str, list[RetrievedItem]] | None:
+    """DB형·DC형의 제도 차이(운용주체·계산방식)를 일반론으로 설명한다.
+
+    실측(no.1 "DC와 DB, 퇴직금이 정해지는 방식이랑 운용 주체가 어떻게 다른가요?",
+    no.27 "DB형은 제가 받을 퇴직금이 미리 확정돼 있는 게 맞나요?"): 근거를 7건씩
+    갖고도 LLM이 DB 급여 계산식을 "평균 임금의 60% x 근속연수"로 창작했다. 정답은
+    이미 문서에 있었다 — 정형 경로로 확정해 창작 여지를 아예 없앤다.
+
+    ⚠️ 구체적인 개인 계산 질문은 여기서 답하지 않는다("근속 10년인데 퇴직금 얼마
+    받나요" 등 숫자를 대입한 계산 요구). 이 카테고리는 "일반형만 확정한다" 원칙에
+    따라 제도 설명만 다룬다 — 판정은 1인칭 여부가 아니라 숫자·계산 요구 여부다.
+    """
+    text = _compact(question)
+    if _NUMBER_PRESENT_RE.search(text) or any(
+        marker in text for marker in _DB_DC_CALCULATION_SIGNAL_MARKERS
+    ):
+        return None
+    asks_db = "DB" in question or "확정급여" in text
+    asks_dc = "DC" in question or "확정기여" in text
+    # "차이/비교"뿐 아니라 "바꾸면/전환하면 ~ 달라지나요"도 결국 DB·DC 계산식을
+    # 나란히 설명해야 답이 되는 질문이다. 실측(no.123 "DB형에서 DC형으로 바꾸면
+    # 세액공제나 투자 방식이 어떻게 달라지나요?"): 이 표현이 asks_comparison에
+    # 없어서 정형 핸들러가 None을 반환했고, LLM이 no.1/no.27과 같은 "평균임금
+    # 60% x 근속연수" 계산식을 다시 창작했다 — 이 카테고리를 만든 목적 자체가
+    # 무력화됐다.
+    asks_comparison = any(
+        word in text for word in ("차이", "다른가", "다른가요", "다릅니", "비교", "달라지", "바뀌")
+    )
+    asks_db_calc = asks_db and any(word in text for word in ("계산", "산정", "얼마로", "어떻게정해"))
+    asks_operator = any(word in text for word in ("운용주체", "누가운용", "누가굴리", "직접운용"))
+    asks_db_confirmation = asks_db and _DB_CONFIRMATION_RE.search(text) is not None
+    if not (
+        (asks_db and asks_dc and (asks_comparison or asks_operator))
+        or asks_db_calc
+        or asks_db_confirmation
+    ):
+        return None
+    draft = (
+        "퇴직연금제도는 확정급여형(DB)과 확정기여형(DC)으로 나뉩니다.\n\n"
+        "**DB형(확정급여형)**\n"
+        "- 회사가 적립금을 운용하고, 근로자가 퇴직 시 받을 금액은 사전에 확정되어 있습니다.\n"
+        "- 급여 계산식: 퇴직 전 평균임금 30일분 x 계속근로기간\n\n"
+        "**DC형(확정기여형)**\n"
+        "- 회사가 매년 일정 금액을 근로자 명의 계좌에 입금하고, 근로자 본인이 직접 운용합니다.\n"
+        "- 최종 퇴직금은 운용 수익률에 따라 달라집니다.\n\n"
+        "즉 운용 주체가 DB는 회사, DC는 근로자 본인이라는 점이 핵심 차이입니다. "
+        "제도 변경은 DB에서 DC로는 가능하지만 DC에서 DB로는 불가능합니다."
+    )
+    return draft, _context(_DB_DC_COMPARISON_SOURCE, _DB_DC_COMPARISON_CONTENT)
+
+
+# 실물이전(상품 매도 없이 금융기관만 변경)과 이체(현금으로 다른 종류 계좌로 옮김)는
+# 서로 다른 제도다. 근거: [퇴직연금 실물이전제도 안내], [IRP 중도인출·계약해지·이체
+# 및 연금인출 안내].
+_ACCOUNT_TRANSFER_SOURCE = "퇴직연금 실물이전제도 안내 / IRP 중도인출·계약해지·이체 및 연금인출 안내"
+_ACCOUNT_TRANSFER_CONTENT = (
+    "실물이전제도(2024년 10월 31일 시행): 보유 중인 상품을 매도하지 않고 퇴직연금 "
+    "금융기관을 변경하는 제도. 동일 제도 간에만 가능하다 — DB제도→DB제도, "
+    "DC제도→DC제도, IRP계좌→IRP계좌. DB/DC제도는 재직 중인 회사를 통해서만 이전 "
+    "신청이 가능하고, IRP계좌는 영업점 또는 모바일(M-STOCK: 연금>타사연금가져오기/"
+    "실물이전 경로)로 직접 신청할 수 있다.\n\n"
+    "개인형 IRP 이체(소득세법 시행령 40조): 세액공제·과세이연 등 세제혜택을 유지하며 "
+    "다른 연금계좌로 이체하는 것으로, 전액 이체만 가능하다.\n"
+    "- IRP 상호간 이체: 가입자 부담금·이연퇴직소득이 있는 모든 IRP계좌 대상. "
+    "연령 제한 없이 가능하며 실물이전도 가능하다.\n"
+    "- IRP ↔ 연금저축계좌 간 이체: 가입자 연령 55세 이상 and 연금계좌 가입일로부터 "
+    "5년 경과 시 가능(이연퇴직소득이 있으면 연령·경과기간 요건 완화). 실물이전은 "
+    "불가하고 현금이전만 가능하다."
+)
+
+
+def _account_transfer_procedure_response(question: str) -> tuple[str, list[RetrievedItem]] | None:
+    """IRP·연금저축 계좌를 다른 금융기관·다른 종류로 옮기는 절차를 일반론으로 설명한다.
+
+    실측(no.56 "IRP 계좌를 다른 증권사로 옮기려면 어떻게 해야 하나요?"): 근거를
+    10건 확보하고도 LLM이 "2013년 3월 1일 이후 가입한 연금계좌는 그 이전 가입
+    계좌로 옮길 수 없다"는 규정을 창작했다. 근거를 다시 확인한 결과 2013.03.01은
+    실재하는 날짜이지만 **완전히 다른 제도**(연금수령연차 계산 시작점 — 그 이전
+    가입한 구 연금저축계좌는 6년차부터 시작)에 관한 것이었다. 계좌 이전 가능 여부와는
+    무관한데, LLM이 절반쯤 기억한 날짜를 엉뚱한 맥락에 갖다 붙인 전형적인 창작이다.
+
+    ⚠️ 개인 상황(본인이 보유한 상품 유형·연령 등을 대입한 개별 판정)은 다루지
+    않는다. "일반형만 확정한다" 원칙에 따라 이전 절차·조건의 일반론만 설명한다.
+    """
+    text = _compact(question)
+    mentions_irp_or_pension_account = any(
+        word in text for word in ("IRP", "irp", "연금저축", "퇴직연금", "연금계좌")
+    )
+    asks_transfer = any(
+        word in text for word in ("이전", "옮기", "옮겨", "이체", "증권사를바꾸", "금융기관을바꾸")
+    )
+    if not (mentions_irp_or_pension_account and asks_transfer):
+        return None
+    # 개인 판정 신호(구체적 상품 상태·연령 등을 대입한 질문)는 여기서 답하지 않는다.
+    if any(word in text for word in ("제가보유", "제보유", "실물이전가능한가요", "MMF", "RP상품")):
+        return None
+    draft = (
+        "IRP·연금저축 계좌를 다른 금융기관으로 옮기는 방법은 두 가지입니다.\n\n"
+        "**1. 실물이전** (2024년 10월 31일 시행)\n"
+        "- 보유 중인 상품을 매도하지 않고 금융기관만 변경합니다.\n"
+        "- 동일 제도 간에만 가능합니다: IRP계좌→IRP계좌, DC제도→DC제도, DB제도→DB제도.\n"
+        "- IRP계좌는 영업점 방문 또는 모바일 앱으로 직접 신청할 수 있습니다.\n"
+        "- DB/DC제도는 재직 중인 회사를 통해서만 이전 신청이 가능합니다.\n\n"
+        "**2. 이체** (다른 종류의 연금계좌로 옮길 때)\n"
+        "- 세액공제·과세이연 혜택을 유지하며 다른 연금계좌로 전액 이체합니다.\n"
+        "- IRP 상호간 이체는 연령 제한 없이 가능하고 실물이전도 가능합니다.\n"
+        "- IRP와 연금저축계좌 간 이체는 만 55세 이상이고 가입일로부터 5년이 지나야 "
+        "가능하며, 이 경우 실물이전은 안 되고 현금이전만 가능합니다.\n\n"
+        "본인이 보유한 상품 유형이나 구체적인 조건에 따라 적용되는 방식이 달라질 수 "
+        "있으니, 정확한 절차는 이전받을 금융기관에 문의하시기 바랍니다."
+    )
+    return draft, _context(_ACCOUNT_TRANSFER_SOURCE, _ACCOUNT_TRANSFER_CONTENT)
+
+
+# 근거: [연금저축계좌·IRP 세액공제 안내 — 연금계좌 종류와 가입대상 / 납입한도와
+# 세액공제한도 / 분산 납입과 중도인출 유연성].
+_ACCOUNT_CHOICE_SOURCE = "연금저축계좌·IRP 세액공제 안내"
+_ACCOUNT_CHOICE_CONTENT = (
+    "연금계좌는 연금저축과 IRP 두 종류다. 연금저축은 누구나 가입할 수 있다 — 소득이 "
+    "없어도 가입은 가능하지만, 직장인·자영업자 등 종합소득이 있어야 세액공제 혜택을 "
+    "본다. IRP는 직장인, 자영업자, 직역연금가입자 등 가입대상이 정해져 있다.\n\n"
+    "연금저축과 IRP는 합산해서 연 1,800만원까지 납입 가능하다. 세액공제 대상 납입한도는 "
+    "연금저축 단독 연 600만원, IRP는 연금저축 납입액을 포함해서 연 900만원이다. "
+    "연금저축만 있다면 IRP를 추가로 가입해야 연 900만원 한도를 채울 수 있다. "
+    "IRP에만 900만원을 납입해도 세액공제 효과는 연금저축+IRP 조합과 같다.\n\n"
+    "그런데도 두 계좌에 나눠 납입하는 이유는 중도인출 유연성 때문이다. 연금저축펀드는 "
+    "부분 인출이 자유롭다 — 필요할 때 원하는 금액을 인출할 수 있다(과세재원이면 16.5% "
+    "기타소득세 적용, 남은 금액은 계속 운용). 반면 IRP는 무주택자의 주택 구입 등 법정 "
+    "사유를 충족해야만 부분 인출이 가능해 훨씬 까다롭다."
+)
+
+
+def _account_choice_guide_response(question: str) -> tuple[str, list[RetrievedItem]] | None:
+    """연금저축과 IRP 중 어떤 계좌를 선택할지, 왜 나눠 갖는지를 일반론으로 설명한다.
+
+    실측(no.368 "직장인이면 IRP만 만들어도 되나요, 연금저축도 같이 만들어야 하나요?"):
+    grounded=False로 "1,500만 원"을 근거 없이 확정 지었다. 정답은 이미 문서에 있었다
+    — 세액공제 효과는 IRP 단독으로도 동일하지만, 중도인출 유연성 때문에 나눠 갖는
+    것이 실무적으로 권장된다는 내용이다.
+
+    ⚠️ 구체적인 개인 세액공제액 계산("제 소득에서 얼마 공제되나요")은 다루지 않는다.
+    """
+    text = _compact(question)
+    mentions_pension_account = any(
+        word in text for word in ("연금저축", "IRP", "irp", "연금계좌")
+    )
+    asks_choice = any(
+        word in text for word in (
+            "만들어야", "가입해야", "같이만들어야", "둘다", "나눠서", "나눠",
+            "어느게", "어떤게", "뭐가좋", "어느쪽이", "만해도", "만가입해도",
+            "뭐가달라", "뭐가다른", "차이가뭐", "차이가뭔",
+        )
+    )
+    if not (mentions_pension_account and asks_choice):
+        return None
+    # 개인 세액공제액 계산 요구는 여기서 답하지 않는다.
+    if any(word in text for word in ("계산해", "얼마공제", "몇만원공제")):
+        return None
+    draft = (
+        "연금저축과 IRP는 세액공제 효과만 놓고 보면 IRP 하나만 있어도 됩니다 — "
+        "IRP에 900만원을 납입해도 세액공제 대상 한도(연 900만원)를 그대로 채울 수 "
+        "있기 때문입니다.\n\n"
+        "그런데도 실무적으로는 두 계좌를 나눠 갖는 것을 권장하는데, **중도인출 "
+        "유연성** 때문입니다.\n\n"
+        "- **연금저축펀드**: 부분 인출이 자유롭습니다. 필요할 때 원하는 금액만큼 "
+        "인출할 수 있고(과세재원이면 16.5% 기타소득세), 남은 금액은 계속 운용됩니다.\n"
+        "- **IRP**: 무주택자의 주택 구입 등 법정 사유를 충족해야만 부분 인출이 "
+        "가능해 훨씬 까다롭습니다.\n\n"
+        "즉 세액공제만 목적이면 IRP 단독으로 충분하지만, 향후 예기치 않게 자금이 "
+        "필요할 가능성을 고려한다면 연금저축과 IRP를 나눠 갖는 것이 유연합니다. "
+        "참고로 가입 대상 자체도 다릅니다 — 연금저축은 소득이 없어도 가입할 수 "
+        "있지만(단, 세액공제를 받으려면 종합소득이 있어야 함), IRP는 직장인·자영업자 "
+        "등 가입대상이 정해져 있습니다."
+    )
+    return draft, _context(_ACCOUNT_CHOICE_SOURCE, _ACCOUNT_CHOICE_CONTENT)
 
 
 def _tax_benefit_overview_response(question: str) -> tuple[str, list[RetrievedItem]]:
@@ -729,13 +1426,30 @@ def _tax_benefit_overview_response(question: str) -> tuple[str, list[RetrievedIt
         f"세액공제율은 총급여 {_won(INCOME_THRESHOLD_SALARY)} 이하 또는 종합소득금액 "
         f"{_won(INCOME_THRESHOLD_COMPREHENSIVE)} 이하이면 {_pct(CREDIT_RATE_LOW)}, "
         f"초과이면 {_pct(CREDIT_RATE_HIGH)}입니다. "
-        f"사적연금소득은 연 {_won(ANNUAL_THRESHOLD)} 초과 여부가 종합과세 판단 기준이며, "
+        f"과세대상 사적연금소득은 연 {_won(ANNUAL_THRESHOLD)} 초과 여부가 종합과세 판단 기준이며, "
         f"초과 시 종합과세 또는 {_pct(SEPARATE_TAXATION_RATE_OVER_THRESHOLD)} 분리과세를 선택할 수 있습니다. "
-        f"연금소득세율은 만 55세 이상 70세 미만 5.5%, 70세 이상 80세 미만 4.4%, 80세 이상 3.3%입니다. "
+        f"이 판정 대상은 세액공제 받은 납입금과 운용수익 재원이며, 세액공제 받지 않은 원금과 "
+        f"퇴직금(이연퇴직소득) 재원은 제외합니다. "
+        f"세액공제 받은 납입금·운용수익 재원의 연금소득세율은 만 55세 이상 70세 미만 5.5%, "
+        f"70세 이상 80세 미만 4.4%, 80세 이상 3.3%입니다. "
         f"종신연금은 연령과 무관하게 3.3%입니다. "
         f"퇴직금을 연금으로 받을 때 이연퇴직소득세는 연금실제수령연차 1~10년차 30%, "
         f"11~20년차 40%, 21년차 이상 50% 감면됩니다."
     )
+    # 사용자가 나이를 밝혔으면 그 값으로 적용 구간을 확정해 준다 — 알고 있는 것을
+    # 되묻지 않는다. 단 **세액공제 재원에 한정**해서만 확정한다: 같은 나이라도 퇴직금
+    # 재원은 이연퇴직소득세 체계라 이 세율표가 적용되지 않으므로, 나이만으로 전체
+    # 절세액을 단정하면 재원이 뒤섞인 오답이 된다(_pension_income_tax_rate_response의
+    # docstring이 경고하는 실측 사고와 같은 구조).
+    age = _extract_age(question)
+    if age is not None and age >= 55:
+        age_line = (
+            f"- 말씀하신 만 {age}세는 '{_age_bracket_label(age)}' 구간이라, 이 재원에 대해서는 "
+            f"{_pct(get_pension_income_tax_rate(age))}가 적용됩니다.\n"
+        )
+    else:
+        age_line = ""
+
     draft = (
         "연금계좌의 세금혜택은 크게 네 가지로 볼 수 있습니다.\n\n"
         "1. 납입할 때 세액공제\n"
@@ -747,12 +1461,18 @@ def _tax_benefit_overview_response(question: str) -> tuple[str, list[RetrievedIt
         "- 계좌 안에서 발생한 운용수익에 대해 매년 바로 과세하지 않고, 나중에 인출할 때 과세하는 구조입니다.\n\n"
         "3. 연금으로 받을 때 낮은 세율 적용\n"
         "- 세액공제 받은 납입금과 운용수익을 연금으로 받으면 연령에 따라 5.5%, 4.4%, 3.3% 세율이 적용될 수 있습니다.\n"
+        f"{age_line}"
         "- 종신연금은 연령과 무관하게 3.3%입니다.\n"
-        "- 사적연금소득이 연 1,500만원을 초과하면 종합과세 또는 16.5% 분리과세 선택 문제가 생길 수 있습니다.\n\n"
+        "- 과세대상 사적연금소득이 연 1,500만원을 초과하면 종합과세 또는 16.5% 분리과세 선택 문제가 생길 수 있습니다. "
+        "이 1,500만원 판정에는 세액공제 받은 납입금과 운용수익만 포함하고, 세액공제 받지 않은 원금과 "
+        "퇴직금 재원은 제외합니다.\n\n"
         "4. 퇴직금을 연금으로 받을 때 퇴직소득세 감면\n"
-        "- 퇴직금을 연금으로 받으면 이연퇴직소득세가 연금실제수령연차에 따라 30%, 40%, 50% 감면될 수 있습니다.\n\n"
+        "- 퇴직금을 연금으로 받으면 이연퇴직소득세가 연금실제수령연차에 따라 30%, 40%, 50% 감면될 수 있습니다.\n"
+        "- 위 3번의 연령별 세율(5.5%/4.4%/3.3%)은 이 퇴직금 재원에는 적용되지 않습니다 — 재원별로 과세 체계가 다릅니다.\n\n"
         "정리하면, 연금계좌는 납입 시점에는 세액공제, 운용 중에는 과세이연, 수령 시점에는 저율 과세 또는 "
-        "퇴직소득세 감면을 기대할 수 있는 구조입니다."
+        "퇴직소득세 감면을 기대할 수 있는 구조입니다.\n\n"
+        "본인에게 적용될 세액을 재원별로 나눠 보려면 퇴직금 규모, 기존 연금저축·IRP 보유 여부, "
+        "연간 예상 인출액을 알려주세요."
     )
     return draft, _context(source, content)
 
@@ -793,7 +1513,55 @@ def _tax_credit_rate_for_income(values: dict[str, int | None]) -> str | None:
     )
 
 
+# ISA 만기 자금을 연금계좌로 전환할 때는 일반 세액공제 한도(900만원)와 답이 다르다 —
+# 전환입금액의 10%(최대 300만원)가 추가로 공제 대상에 더해진다. 실측(20문항 스팟체크
+# T20 "ISA 만기됐는데 연금계좌로 전환하면 세액공제 어떻게 되나요?"): "세액공제"라는
+# 단어만 보고 candidate_categories가 세액공제_한도로 후보를 냈는데, 그 핸들러는 ISA를
+# 전혀 다루지 않아 일반 900만원 답변(할루시네이션은 아니지만 사실상 오답)이 나갔다.
+# 근거: [ISA 만기 자금 연금계좌 전환납입 절세 혜택 안내 — 연금계좌 세액공제 최대 절세액].
+_ISA_CONVERSION_SOURCE = "ISA 만기 자금 연금계좌 전환납입 절세 혜택 안내 — 연금계좌 세액공제 최대 절세액"
+_ISA_CONVERSION_CONTENT = (
+    "ISA 만기 자금을 연금계좌로 전환납입하면 일반 세액공제 한도(연금저축 600만원, "
+    "IRP 포함 900만원)에 더해 ISA 전환입금액의 10%(최대 300만원)가 추가로 공제 "
+    "대상에 더해진다. 인당 최대 추가 공제 한도는 300만원이다(직전·이번 과세연도에 "
+    "걸쳐 나눠 납입해도 동일).\n\n"
+    "따라서 ISA→연금저축계좌 전환 연도의 세액공제 대상 한도는 600만원+300만원 = "
+    "900만원이고, IRP 계좌로 전환하면 900만원+300만원 = 1,200만원이다(2023년 1월 1일 "
+    "이후 납입분부터 적용).\n\n"
+    "세액공제율은 총급여 5,500만원 이하 또는 종합소득금액 4,500만원 이하이면 16.5%, "
+    "초과이면 13.2%다. 예: IRP 전환 시 최대 세액공제액은 1,200만원 x 16.5% = 198만원, "
+    "1,200만원 x 13.2% = 158만 4천원이다."
+)
+
+
+def _isa_conversion_response(question: str) -> tuple[str, list[RetrievedItem]] | None:
+    """ISA 만기 자금을 연금계좌로 전환할 때의 세액공제 특례를 답한다.
+
+    일반 세액공제 한도 핸들러(_tax_credit_limit_response)와 정답이 다르므로 별도로
+    분기한다 — ISA 언급이 없으면 이 함수는 관여하지 않고(None) 일반 핸들러가 처리한다.
+    """
+    text = _compact(question)
+    if "ISA" not in question and "isa" not in text:
+        return None
+    if not any(word in text for word in ("전환", "만기")):
+        return None
+    return (
+        "ISA 만기 자금을 연금계좌로 전환납입하면 일반 세액공제 한도에 더해 **전환입금액의 "
+        "10%(최대 300만원)**가 추가로 공제 대상에 더해집니다.\n\n"
+        "- **연금저축으로 전환**: 세액공제 대상 한도 600만원 + 300만원 = **900만원**\n"
+        "- **IRP로 전환**: 세액공제 대상 한도 900만원 + 300만원 = **1,200만원**\n\n"
+        "추가 공제 한도(300만원)는 인당 기준이며, 직전 과세연도와 이번 연도에 걸쳐 나눠 "
+        "납입해도 합산 최대 300만원까지만 적용됩니다.\n\n"
+        "세액공제율은 총급여 5,500만원 이하 또는 종합소득금액 4,500만원 이하이면 16.5%, "
+        "초과이면 13.2%입니다. 예를 들어 IRP로 전환한 경우 최대 세액공제액은 "
+        "1,200만원 x 16.5% = 198만원, 1,200만원 x 13.2% = 158만 4천원입니다."
+    ), _context(_ISA_CONVERSION_SOURCE, _ISA_CONVERSION_CONTENT)
+
+
 def _tax_credit_limit_response(question: str) -> tuple[str, list[RetrievedItem]]:
+    isa_response = _isa_conversion_response(question)
+    if isa_response is not None:
+        return isa_response
     source = "doc41 세액공제 규칙"
     content = (
         f"연금저축+IRP 합산 납입한도는 연 {_won(TOTAL_CONTRIBUTION_LIMIT)}입니다. "
@@ -827,22 +1595,12 @@ def _tax_credit_limit_response(question: str) -> tuple[str, list[RetrievedItem]]
     if income_rate_draft is not None:
         return income_rate_draft, _context(source, content)
 
-    pension_savings_paid = values["pension_savings_paid"]
-    asks_all_credited = any(word in _compact(question) for word in ("전부", "모두", "다세액공제", "전체"))
-    if pension_savings_paid and values["irp_paid"] is None and asks_all_credited:
-        credited = min(pension_savings_paid, PENSION_SAVINGS_ONLY_LIMIT)
-        excess = max(0, pension_savings_paid - PENSION_SAVINGS_ONLY_LIMIT)
-        if excess:
-            draft = (
-                f"아니요. 연금저축에 {_won(pension_savings_paid)}을 납입했더라도, **연금저축만으로는 "
-                f"{_won(PENSION_SAVINGS_ONLY_LIMIT)}까지만 세액공제 대상**입니다.\n\n"
-                f"- 세액공제 대상 연금저축 납입액: {_won(credited)}\n"
-                f"- 연금저축 단독 한도를 넘는 금액: {_won(excess)}\n\n"
-                f"연금저축과 IRP를 함께 활용하면 두 계좌 합산으로 {_won(COMBINED_CREDIT_LIMIT)}까지 "
-                "세액공제 대상이 될 수 있지만, 연금저축 단독 한도 자체가 900만원으로 늘어나는 구조는 아닙니다.\n\n"
-                "세액공제율은 소득 기준에 따라 16.5% 또는 13.2%가 적용됩니다."
-            )
-            return draft, _context(source, content)
+    # 소득 없이도 한도 이내 여부만으로 답이 확정되는 질문("전부 공제되나요" /
+    # "OOO만원 기준으로 계산되나요")이면 바로 답한다 — 세액공제_계산_입력부족
+    # 핸들러와 판정 로직을 공유해, 라우터가 어느 카테고리를 확정하든 답이 갈리지 않게 한다.
+    limit_only = _tax_credit_limit_only_question_response(question, values, source, content)
+    if limit_only is not None:
+        return limit_only
 
     draft = (
         "연금저축과 IRP를 합쳐서 볼 때 핵심은 **세액공제 대상 한도는 합산 900만원**이라는 점입니다.\n\n"
@@ -2278,6 +3036,14 @@ def _retirement_tax_reduction_response(question: str) -> tuple[str, list[Retriev
         f"{_pct(r11.reduction_ratio)}를 감면합니다. 21년차 이상은 {_pct(r21.payment_ratio)}를 납부하고 "
         f"{_pct(r21.reduction_ratio)}를 감면합니다. 연금외수령은 감면 없이 전액 납부합니다."
     )
+    # ⚠️ 예전에는 question을 받고도 전혀 읽지 않아, 사용자가 연금실제수령연차를 밝혀도
+    # 항상 같은 일반표만 반환했다. 같은 질문이 라우터의 선택에 따라 개인세금_입력충분성으로
+    # 가면 연차를 정직하게 되묻는데(personal_tax_response), 이 카테고리로 오면 되묻지도
+    # 확정하지도 않고 일반표로 끝나 답변 완결성이 라우터의 비결정적 선택에 좌우됐다
+    # (실측 T09/T10 vs T12/T18). 다른 결정론 핸들러(_pension_income_tax_rate_response,
+    # _withdrawal_limit_response)는 이미 질문에서 값을 읽어 확정하는 패턴을 쓴다.
+    actual_receipt_year = extract_tax_context(question).actual_pension_year
+
     draft = (
         "퇴직금을 연금으로 수령하면 이연퇴직소득세가 연차에 따라 감면됩니다.\n\n"
         "- 연금실제수령연차 1~10년차: 이연퇴직소득세의 70% 납부, 30% 감면\n"
@@ -2286,6 +3052,27 @@ def _retirement_tax_reduction_response(question: str) -> tuple[str, list[Retriev
         "주의할 점은 여기서 쓰는 기준이 '연금수령연차'가 아니라 실제로 인출한 해만 세는 "
         "'연금실제수령연차'라는 점입니다. 연금외수령이면 감면 없이 이연퇴직소득세 전액을 납부합니다."
     )
+
+    if actual_receipt_year is not None:
+        applied = get_deferred_retirement_tax_rate(actual_receipt_year, is_pension_receipt=True)
+        draft += (
+            f"\n\n말씀하신 연금실제수령연차 {actual_receipt_year}년차는 이연퇴직소득세의 "
+            f"{_pct(applied.payment_ratio)}를 납부하고 {_pct(applied.reduction_ratio)}를 감면받는 구간입니다.\n"
+            "실제 납부세액은 원래 부과될 이연퇴직소득세 금액에 이 비율을 적용해 계산합니다 — "
+            "그 금액은 퇴직 시점에 확정되므로 퇴직금 수령 기관에서 확인하실 수 있습니다."
+        )
+        content += (
+            f" 입력 조건의 연금실제수령연차 {actual_receipt_year}년차는 "
+            f"{_pct(applied.payment_ratio)} 납부, {_pct(applied.reduction_ratio)} 감면 구간입니다."
+        )
+    else:
+        # 연차를 모르면 감면율을 확정할 수 없다 — 되묻되, 위 일반 규칙은 이미 답했으므로
+        # 답변 자체를 막지는 않는다(알고 있는 것은 답하고 모르는 것만 묻는다).
+        draft += (
+            "\n\n본인에게 적용될 감면율을 확정하려면 연금실제수령연차가 몇 년차인지 알려주세요. "
+            "정확한 세액까지 계산하려면 원래 부과될 이연퇴직소득세 금액도 함께 필요합니다."
+        )
+
     return draft, _context(source, content)
 
 
@@ -2414,6 +3201,11 @@ def _pension_income_tax_rate_response(question: str) -> tuple[str, list[Retrieve
 
 _CATEGORY_HANDLERS = {
     "복합정보_태스크플랜": _composite_info_task_plan_response,
+    "제도비교_DB_DC": _db_dc_comparison_response,
+    "계좌이전_절차": _account_transfer_procedure_response,
+    "계좌선택_가이드": _account_choice_guide_response,
+    "퇴직연금_유형비교": _retirement_plan_comparison_response,
+    "퇴직급여_연금계좌_세금전제검증": _retirement_benefit_tax_premise_gate_response,
     "세액공제_계산_입력부족": _tax_credit_calculation_missing_response,
     "세액공제_한도": _tax_credit_limit_response,
     "세금혜택_개요": _tax_benefit_overview_response,

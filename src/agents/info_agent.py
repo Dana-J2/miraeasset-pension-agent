@@ -26,6 +26,7 @@ from src.agents.deterministic_info import (
 )
 from src.agents.in_kind_transfer_intent import has_in_kind_transfer_intent
 from src.agents.llm import get_llm, invoke_with_retry
+from src.agents.query_rewrite import rewrite_search_queries
 from src.agents.state import PensionAgentState, RetrievedItem, ToolCallRecord
 from src.agents.tools import INFO_AGENT_TOOLS, search_pension_docs
 
@@ -52,6 +53,15 @@ INFO_AGENT_SYSTEM_PROMPT = """당신은 연금 제도·세금 전문 상담 에�
    부족하면 한 가지 값만 묻지 말고, 현재 제공된 정보·현재 답변 가능한 일반 기준·부족한 입력값
    전체·입력값별 구체적 역질문을 첫 답변 안에 모두 포함하세요. 이렇게 조건이 부족해 되묻는
    답변에는 반드시 [추가 확인 필요] 표시를 포함하세요 (위치는 어디든 상관없습니다).
+
+   ⚠️ 역질문이 필요한 답변은 반드시 이 순서를 지키세요:
+   1) 지금 근거(search_pension_docs 결과)로 말씀드릴 수 있는 일반 기준을 **먼저** 씁니다.
+      제도 자체의 한도·요건·세율처럼 사용자 조건과 무관하게 정해진 내용은 개인 상황을
+      몰라도 답할 수 있습니다 — 그런 내용까지 되묻기 뒤로 미루지 마세요.
+   2) 그다음 부족한 정보와 구체적 역질문을 씁니다.
+   **역질문만 있고 일반 기준이 전혀 없는 답변은 금지합니다.** 다만 정말로 근거가 없어
+   일반 기준조차 낼 수 없다면(search_pension_docs가 빈 결과를 반환한 경우), 그 사실을
+   그대로 밝히고 역질문만 하는 것은 괜찮습니다 — 근거를 지어내는 것보다는 낫습니다.
 
 ★ 1과 2는 배타적 선택지가 아닙니다 — 한 질문이 둘 다 요구하면 둘 다 호출하세요.
 질문이 여러 항목을 물으면(예: "언제부터 인출 가능하고, 얼마까지 되고, 세금은 어떻게
@@ -109,10 +119,65 @@ def _missing_context_response(state: PensionAgentState) -> tuple[str, list[Retri
     return draft, []
 
 
+def _search_with_rewrites(question: str) -> tuple[list[dict], list[str]]:
+    """원문 검색 결과에 '제도 용어로 재작성한 질의'의 결과를 더해 돌려준다.
+
+    사용자는 일상어로 묻고 문서는 제도 용어로 쓰여 있어, 원문을 그대로 임베딩하면
+    엉뚱한 문서가 잡힌다(실측 S03 "전업주부인데 노후 대비..." -> MP 알림톡 FAQ,
+    d=31.80). 그 빈틈을 LLM이 학습 지식으로 메우는 것이 할루시네이션의 최대
+    발생원이었다 — 같은 질문에서 폐지된 세액공제 한도 400만원이 창작됐다.
+
+    ⚠️ 원문 검색이 0건이면 재작성 결과도 쓰지 않는다. 재작성기는 무엇을 주든
+    연금 검색어를 만들어내므로("오늘 점심 뭐 먹지" -> 5건), 이 가드가 없으면
+    범위 밖 질문이 되살아나 "빈 리스트 = 보유 문서에 없음"이라는 계약이 깨진다.
+
+    ⚠️ 원문 결과를 버리지 않고 **더한다**. 이미 제도 용어로 잘 물은 질문은
+    재작성이 오히려 나빠진다(실측 10.65 -> 17.32).
+    """
+    base = search_pension_docs.invoke({"query": question, "k": 5})
+    if not isinstance(base, list) or not base:
+        return [], []
+
+    merged: list[dict] = list(base)
+    seen = {r.get("chunk_id") for r in merged}
+    used_queries: list[str] = []
+    for rewritten in rewrite_search_queries(question):
+        extra = search_pension_docs.invoke({"query": rewritten, "k": 5})
+        if not isinstance(extra, list) or not extra:
+            continue
+        used_queries.append(rewritten)
+        for r in extra:
+            if r.get("chunk_id") in seen:
+                continue
+            seen.add(r.get("chunk_id"))
+            merged.append(r)
+
+    # 거리(distance)가 작을수록 질문에 가깝다. 재작성 질의가 찾아온 더 정확한
+    # 문서가 앞에 오도록 정렬한 뒤 상위 5건만 근거로 넘긴다.
+    merged.sort(key=lambda r: r.get("distance", float("inf")))
+    return merged[:5], used_queries
+
+
+def _searched_with_raw_question(tool_trace: list[ToolCallRecord], question: str) -> bool:
+    """LLM이 문서 검색에 질문 원문을 그대로 넘겼는지 판정한다.
+
+    실측(501문항): search_pension_docs 호출 210건 중 83건(39%)이 원문 그대로였다.
+    이 경우 일상어와 제도 용어의 간극 때문에 근거 품질이 떨어지기 쉬우므로,
+    제도 용어로 재작성한 검색을 한 번 더 돌려 근거를 보강한다.
+    """
+    head = (question or "").strip("?. ")[:24]
+    if len(head) < 8:
+        return False
+    return any(
+        record.get("tool") == "search_pension_docs" and head in (record.get("args") or "")
+        for record in tool_trace
+    )
+
+
 def _doc_search_context(question: str) -> tuple[list[RetrievedItem], list[ToolCallRecord]]:
     """LLM이 RAG 호출을 건너뛴 경우에도 정보형 질문은 한 번 직접 검색해 근거를 확보한다."""
-    results = search_pension_docs.invoke({"query": question, "k": 5})
-    if not isinstance(results, list) or not results:
+    results, rewritten_queries = _search_with_rewrites(question)
+    if not results:
         return [], [
             {
                 "node": "info_agent",
@@ -142,11 +207,16 @@ def _doc_search_context(question: str) -> tuple[list[RetrievedItem], list[ToolCa
             }
         )
     titles = "; ".join(item["source"] for item in items[:3])
+    # 재작성 질의를 think_trace에 드러낸다 — 실제로 검색한 것과 기록이 다르면
+    # "추론 논리성" 서사가 사실과 어긋난다.
+    args = f'query="{question}", k=5'
+    if rewritten_queries:
+        args += f" (+제도용어 재작성: {'; '.join(rewritten_queries)})"
     return items, [
         {
             "node": "info_agent",
             "tool": "search_pension_docs",
-            "args": f'query="{question}", k=5',
+            "args": args,
             "result": f"{len(items)}건 검색: {titles}",
         }
     ]
@@ -276,6 +346,19 @@ def build_info_agent_node():
             forced_context, forced_trace = _doc_search_context(state["question"])
             retrieved_context = forced_context
             tool_trace = [*tool_trace, *forced_trace]
+        elif _searched_with_raw_question(tool_trace, state["question"]):
+            # 근거는 있지만 LLM이 **질문 원문을 그대로** 검색어로 쓴 경우다.
+            # 사용자는 일상어로 묻고 문서는 제도 용어로 쓰여 있어, 이 조합은 엉뚱한
+            # 문서를 끌어오기 쉽다(실측 S03: "전업주부인데 노후 대비..." -> MP 알림톡
+            # FAQ). 제도 용어로 재작성한 질의 결과를 **더해서** 근거를 보강한다.
+            #
+            # 실측(501문항): 근거는 있는데 grounded=False인 32건 중 9건이 이 경로였고,
+            # 표본 5건에서 3건이 뚜렷이 개선됐다(25.9 -> 10.8 등), 나빠진 건 없었다.
+            # 원문 결과를 버리지 않고 합치므로 이미 좋은 검색은 그대로 유지된다.
+            extra_context, extra_trace = _doc_search_context(state["question"])
+            if extra_context:
+                retrieved_context = [*retrieved_context, *extra_context]
+                tool_trace = [*tool_trace, *extra_trace]
 
         # ⚠️ response_mode를 안 채우면 Guardian(파수꾼)이 절대 작동하지 않는다 —
         # _guardian_route_possible이 response_mode=="complete"를 요구하는데, 이 LLM

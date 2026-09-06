@@ -27,6 +27,7 @@ from src.agents.context import (
     split_clarification_marker,
 )
 from src.agents.llm import get_llm, invoke_with_retry
+from src.agents.product_resolver import resolve_product
 from src.agents.state import PensionAgentState, RetrievedItem
 from src.agents.tools import PRODUCT_AGENT_TOOLS, search_funds
 from src.rules.early_withdrawal import PlanType
@@ -132,6 +133,15 @@ _INVESTMENT_LIMIT_CONTENT = (
     "위험자산은 DB/DC/IRP 공통으로 적립금의 70%까지만 투자 가능하며, "
     "주식형·주식혼합형펀드는 위험자산으로 분류됩니다. "
     "TDF는 감독원장이 정한 조건을 충족하면 DC/IRP에 한해 100%까지 투자할 수 있습니다."
+)
+
+# 연금계좌 가입대상 — 소득 유무로 갈린다. 원문(연금저축계좌·IRP 세액공제 안내 —
+# 연금계좌 종류와 가입대상)의 핵심 문장을 그대로 옮긴다.
+_ACCOUNT_ELIGIBILITY_SOURCE = "연금저축계좌·IRP 세액공제 안내 — 연금계좌 종류와 가입대상"
+_ACCOUNT_ELIGIBILITY_CONTENT = (
+    "연금계좌는 연금저축과 IRP, 두 종류다. 연금저축은 누구나 가입할 수 있다. "
+    "소득이 없어도 가입이 가능하지만 직장인, 자영업자 등 종합소득이 있어야 세액공제 "
+    "혜택을 볼 수 있다. IRP는 직장인, 자영업자, 직역연금가입자 등 가입대상이 정해져 있다."
 )
 
 _SCENARIO_RULE_SOURCE = "상품 시나리오 규칙 — 후보 속성 기반 점검"
@@ -407,14 +417,22 @@ def _explicit_product_context_response(
     if _asks_alternative_recommendation(question):
         return None
 
-    product_code = _extract_product_code(question)
-    class_code = _extract_class_code(question)
-    account_type = _extract_account_type(question)
-    if not (product_code and class_code and account_type):
+    resolved = state.get("resolved_product") or resolve_product(question)
+    product_codes = list(resolved.get("product_codes") or [])
+    class_code = resolved.get("class_code")
+    account_type = resolved.get("cost_account_type")
+    if not (resolved.get("resolved") and product_codes and class_code and account_type):
         return None
 
     normalized_account = normalize_pension_account_type(account_type)
-    detail = get_pension_class_detail(product_code, class_code, normalized_account)
+    detail = None
+    product_code = product_codes[0]
+    for candidate_code in product_codes:
+        candidate_detail = get_pension_class_detail(candidate_code, class_code, normalized_account)
+        if candidate_detail:
+            detail = candidate_detail
+            product_code = candidate_code
+            break
     if not detail:
         return None
 
@@ -439,9 +457,12 @@ def _explicit_product_context_response(
         "",
         "**확인된 상품 정보**",
         f"- 상품코드: {product_code}",
-        f"- 계좌 유형: {normalized_account}",
+        f"- 계좌 유형: {normalized_account}"
+        + (" 범위" if resolved.get("account_type_source") == "product_scope" else ""),
         f"- 판매채널: {detail.get('channel') or '확인 필요'}",
     ]
+    if resolved.get("account_type_source") == "product_scope":
+        lines.append("- 계좌 세부유형: 질문에 IRP/DC/DB가 명시되지는 않아 실제 가입 가능 여부는 금융기관에서 확인이 필요합니다.")
     if detail.get("risk_grade"):
         lines.append(f"- 위험등급: {detail['risk_grade']}")
     if detail.get("fund_category"):
@@ -482,11 +503,14 @@ def _explicit_product_context_response(
         f"합성총보수·비용={detail.get('synthetic_total_expense_ratio')}%, "
         f"투자설명서효력발생일={detail.get('prospectus_effective_date')}, "
         f"시장잔고={detail.get('aum_krw_million')}백만원, 잔고기준일={detail.get('aum_base_date')}, "
+        f"투자목적={detail.get('investment_objective')}, "
+        f"투자전략={detail.get('investment_strategy')}, "
         f"dataset_version={detail.get('dataset_version')}, dataset_status={detail.get('dataset_status')}"
     )
     context = [{"source": f"{fund_name} ({canonical_class})", "content": content, "node": "product_agent"}]
     profile = dict(state.get("recommendation_profile") or {})
-    profile["account_type"] = account_type
+    if resolved.get("account_type"):
+        profile["account_type"] = resolved["account_type"]
     return "\n".join(lines), context, profile, False
 
 
@@ -498,6 +522,11 @@ def _extract_recommendation_profile(state: PensionAgentState) -> dict:
     account = _extract_account_type(text)
     if account:
         profile["account_type"] = account
+    elif _has_no_income_status(text):
+        # 소득이 없는 신분이면 가입 가능한 계좌가 연금저축 하나로 좁혀진다 — 되물을
+        # 필요 없이 근거로 확정할 수 있다(IRP/DC/DB는 가입대상이 정해져 있다).
+        profile["account_type"] = "연금저축"
+        profile["no_income_status"] = True
 
     monthly = _extract_amount(current, allow_standalone=True) or _extract_amount(text)
     if monthly:
@@ -538,6 +567,36 @@ def _extract_account_type(text: str) -> str | None:
     if "연금저축" in text:
         return "연금저축"
     return None
+
+
+# 근로·사업소득이 없음을 드러내는 표현. 연금계좌는 **가입 자격이 소득 유무로 갈리므로**
+# (연금저축은 누구나, IRP는 직장인·자영업자·직역연금가입자, DB/DC는 재직 근로자),
+# 이 신호가 있으면 계좌유형을 되물을 게 아니라 가능한 것을 짚어줘야 한다.
+_NO_INCOME_STATUS_MARKERS = (
+    "대학생", "대학교", "대학 입학", "대학입학", "신입생", "학생", "고등학생", "중학생",
+    "취업 준비", "취업준비", "취준", "무직", "소득이 없", "소득 없", "수입이 없", "수입 없",
+    "직장이 없", "일을 안", "백수", "전업주부", "주부", "미성년",
+)
+# 위 표현이 있어도 소득이 있음을 함께 밝히면 제외한다 — "학생인데 아르바이트로 소득이
+# 있어요"처럼 예외가 실재한다.
+_HAS_INCOME_MARKERS = (
+    "직장인", "회사원", "재직", "근로소득", "사업소득", "자영업", "프리랜서",
+    "소득이 있", "소득 있", "월급", "연봉", "아르바이트", "알바",
+)
+
+
+def _has_no_income_status(text: str) -> bool:
+    """질문에 "소득이 없는 신분"(학생·무직 등)이 드러나는지 판정한다.
+
+    ⚠️ 계좌유형을 단순히 "사용자에게 물어볼 빈칸"으로만 다루면, 대학생에게 "IRP, DC,
+    DB, 연금저축 중 선택해 주세요"처럼 **답할 수 없는 질문**을 던지게 된다(실측:
+    "이제 막 대학 입학한 학생인데 노후 대비 상품 추천해줘"). 근거 문서에 답이 이미
+    있다 — "연금저축은 누구나 가입할 수 있다. 소득이 없어도 가입이 가능하지만
+    ... IRP는 직장인, 자영업자, 직역연금가입자 등 가입대상이 정해져 있다."
+    """
+    if any(marker in text for marker in _HAS_INCOME_MARKERS):
+        return False
+    return any(marker in text for marker in _NO_INCOME_STATUS_MARKERS)
 
 
 def _extract_amount(text: str, allow_standalone: bool = False) -> str | None:
@@ -668,6 +727,26 @@ def _clarification_questions(missing: list[str]) -> list[str]:
 def _grounded_account_constraint(profile: dict) -> tuple[str, list[RetrievedItem]]:
     """clarification mode에서도 DB/Rule 근거가 있는 계좌 제약만 짧게 안내한다."""
     account = profile.get("account_type")
+
+    if profile.get("no_income_status"):
+        # account_type이 이미 "연금저축"으로 확정돼 있으므로(profile 조립 단계에서)
+        # 아래 IRP/DC 위험자산 분기와는 겹치지 않는다 — 여기서 먼저 반환한다.
+        section = (
+            "확인된 계좌 제약은 다음과 같습니다.\n"
+            "- 소득이 없는 신분이면 연금저축만 가입할 수 있습니다. IRP는 직장인·자영업자·"
+            "직역연금가입자 등 가입대상이 정해져 있어 해당하지 않습니다. DC·DB는 재직 "
+            "근로자의 퇴직연금이라 역시 대상이 아닙니다.\n"
+            "- 다만 연금저축은 소득이 없으면 납입해도 세액공제 혜택은 받을 수 없습니다 — "
+            "종합소득(근로소득·사업소득 등)이 있어야 세액공제가 적용됩니다."
+        )
+        return section, [
+            {
+                "source": _ACCOUNT_ELIGIBILITY_SOURCE,
+                "content": _ACCOUNT_ELIGIBILITY_CONTENT,
+                "node": "product_agent",
+            }
+        ]
+
     preferred = profile.get("preferred_product_type") or ""
     if account not in {"IRP", "DC"}:
         return "", []
@@ -725,10 +804,19 @@ def _clarification_response(profile: dict, missing: list[str]) -> tuple[str, lis
     known = _format_profile_summary(profile)
     missing_labels = ", ".join(_PROFILE_FIELD_LABELS.get(field, field) for field in missing)
     known_block = f"\n\n현재 확인된 조건은 다음과 같습니다.\n{known}" if known else ""
-    account_constraint, context = _grounded_account_constraint(profile)
+    account_constraint, account_context = _grounded_account_constraint(profile)
+    # account_constraint(무소득 신분 등 제약 고지)가 이미 계좌 가입대상을 설명했다면
+    # _general_guidance_block의 account_type 일반론과 내용이 겹친다 — 중복을 피하려고
+    # account_constraint가 비어 있을 때만 일반 기준을 추가한다.
+    general_guidance, guidance_context = (
+        _general_guidance_block(profile, missing) if not account_constraint else ("", [])
+    )
+    context = [*account_context, *guidance_context]
+    guidance_block = f"{general_guidance}\n\n" if general_guidance else ""
     answer = (
         "현재 질문만으로는 특정 상품을 바로 추천하기 어렵습니다."
         f"{known_block}\n\n"
+        f"{guidance_block}"
         "조건에 맞는 상품 후보를 비교하려면 추천 결과를 실제로 바꾸는 정보가 더 필요합니다.\n\n"
         f"{account_constraint}"
         f"{'\n\n' if account_constraint else ''}"
@@ -792,6 +880,61 @@ def _format_profile_summary(profile: dict) -> str:
             value = f"{value}({_RISK_GRADE_DISCLOSURE[value]}으로 해석)"
         rows.append(f"- {label}: {value}")
     return "\n".join(rows)
+
+
+def _general_guidance_block(profile: dict, missing: list[str]) -> tuple[str, list[RetrievedItem]]:
+    """역질문 답변에도 지금 근거로 말할 수 있는 일반 기준을 담는다.
+
+    ## 왜 필요한가
+
+    조건이 부족해 역질문할 때, 예전에는 질문 목록만 던지고 끝났다("부족한 정보는
+    계좌유형, 투자기간입니다. 알려주세요"). 사용자는 아무 답도 못 받은 채 되묻기만
+    당한 셈이라 "정보한계 대응"·"요구사항 충족" 평가지표에 불리하다.
+
+    이 서비스는 단일턴 평가라 실제 멀티턴처럼 답을 받은 뒤 이어갈 수 없다 —
+    그래서 역질문 자체를 답변에서 빼는 대신, **한 응답 안에 "지금 답할 수 있는
+    일반 기준" + "부족한 조건과 역질문"을 함께 넣는다.**
+
+    ## 왜 여기서 새 근거를 만들지 않는가
+
+    이 함수는 새로운 사실을 조사하지 않는다 — 이미 확보해둔 근거 상수만 재사용한다
+    (_ACCOUNT_ELIGIBILITY_CONTENT, _RISK_GRADE_DISCLOSURE는 _search_args_from_profile의
+    실제 검색 조건과 동일한 값). 없는 내용을 조립해 채우면 이 프로젝트가 하루 종일
+    고쳐온 바로 그 할루시네이션 문제를 역질문 경로에 새로 만드는 셈이다.
+
+    ## 무엇을 넣는가 (알려진 조건에 따라 달라진다)
+
+    - account_type이 없으면: 연금저축·IRP 가입대상 차이(계좌선택_가이드와 같은 사실)
+    - risk_profile이 확정됐으면: 그 성향이 검색에서 어느 위험등급대로 해석되는지
+      (_format_profile_summary가 조건 요약에 붙이는 것과 같은 고지)
+    - 그 외에는 아무것도 추가하지 않는다 — 근거 없는 일반론보다 침묵이 낫다.
+    """
+    lines: list[str] = []
+    context: list[RetrievedItem] = []
+
+    if "account_type" in missing:
+        lines.append(
+            "- 계좌 종류: 연금저축은 소득이 없어도 누구나 가입할 수 있지만(세액공제를 "
+            "받으려면 종합소득 필요), IRP는 직장인·자영업자·직역연금가입자 등 가입대상이 "
+            "정해져 있습니다. DC·DB는 재직 중인 회사를 통해 가입하는 퇴직연금제도입니다."
+        )
+        context.append(
+            {
+                "source": _ACCOUNT_ELIGIBILITY_SOURCE,
+                "content": _ACCOUNT_ELIGIBILITY_CONTENT,
+                "node": "product_agent",
+            }
+        )
+
+    risk_profile = profile.get("risk_profile")
+    if risk_profile in _RISK_GRADE_DISCLOSURE:
+        lines.append(f"- 투자성향({risk_profile}): {_RISK_GRADE_DISCLOSURE[risk_profile]} 상품 위주로 검토됩니다.")
+
+    if not lines:
+        return "", []
+
+    section = "현재 조건으로 일반적으로 말씀드릴 수 있는 내용은 다음과 같습니다.\n" + "\n".join(lines)
+    return section, context
 
 
 def _product_type_recommendation_answer(profile: dict) -> str:
@@ -1227,7 +1370,10 @@ def build_product_agent_node():
     react_agent = create_agent(model=llm, tools=PRODUCT_AGENT_TOOLS, system_prompt=PRODUCT_AGENT_SYSTEM_PROMPT)
 
     def product_agent_node(state: PensionAgentState) -> dict:
-        recommendation_flow = _recommendation_flow_response(state)
+        working_state = dict(state)
+        working_state["resolved_product"] = state.get("resolved_product") or resolve_product(state.get("question") or "")
+
+        recommendation_flow = _recommendation_flow_response(working_state)
         if recommendation_flow is not None:
             draft, context, profile, needs_clarification = recommendation_flow
             missing = _missing_profile_fields(profile)
@@ -1256,19 +1402,20 @@ def build_product_agent_node():
                 else "complete"
                 if context
                 else "conditional",
-                "repair_attempted": state.get("verification") is not None,
+                "repair_attempted": working_state.get("verification") is not None,
+                "resolved_product": working_state.get("resolved_product"),
             }
 
-        prior_context = dedupe_context(state.get("retrieved_context") or [])
-        question = state["question"]
-        if state.get("scope") == "부분관련" and state.get("scope_note"):
+        prior_context = dedupe_context(working_state.get("retrieved_context") or [])
+        question = working_state["question"]
+        if working_state.get("scope") == "부분관련" and working_state.get("scope_note"):
             question += (
                 f"\n\n[범위 안내] 이 질문의 핵심은 연금 상담 범위 밖입니다. 범위 밖 부분은 "
-                f"한계를 밝히고, 다음 연금 관점으로만 답하세요: {state['scope_note']}"
+                f"한계를 밝히고, 다음 연금 관점으로만 답하세요: {working_state['scope_note']}"
             )
 
         # verification이 이미 있으면 ④ 탈락으로 되돌아온 repair 재실행이다 (1회 한정).
-        repair_note = build_repair_note(state.get("verification"))
+        repair_note = build_repair_note(working_state.get("verification"))
         if repair_note:
             question += f"\n\n{repair_note}"
 
@@ -1276,13 +1423,13 @@ def build_product_agent_node():
             context_text = "\n".join(f"- [{c['source']}] {c['content']}" for c in prior_context)
             question = f"{question}\n\n[②정보 Agent가 이미 확인한 제도 근거]\n{context_text}"
 
-        history_messages = history_to_messages(state.get("conversation_history"))
+        history_messages = history_to_messages(working_state.get("conversation_history"))
         try:
             result = invoke_with_retry(
                 react_agent, {"messages": [*history_messages, HumanMessage(content=question)]}
             )
         except Exception:
-            fallback_draft, fallback_context = _fallback_product_recommendation(state)
+            fallback_draft, fallback_context = _fallback_product_recommendation(working_state)
             if fallback_context:
                 return {
                     "product_draft": fallback_draft,
@@ -1290,8 +1437,9 @@ def build_product_agent_node():
                     "tool_trace": [],
                     "needs_clarification": False,
                     "recommendation_stage": "specific_recommendation",
-                    "repair_attempted": state.get("verification") is not None,
+                    "repair_attempted": working_state.get("verification") is not None,
                     "product_fallback_used": True,
+                    "resolved_product": working_state.get("resolved_product"),
                 }
             # ⚠️ 여기서 raise하면 그래프 전체가 죽어 API가 500을 반환하고 그 문항은
             # 무응답으로 0점 처리된다 (실측: 501문항 평가에서 5건, 전부 CLOVA 간헐적
@@ -1300,7 +1448,7 @@ def build_product_agent_node():
             # 비싸다"(llm.py)는 이 프로젝트의 원칙에 따라, 여기서는 절대 죽지 않고
             # 최소한 계좌유형을 되묻는 역질문으로 응답한다 — 정보가 부족해 정형 추천을
             # 못 한다는 사실 자체가 사용자에게 유용한 답이다.
-            missing = _missing_profile_fields(_extract_recommendation_profile(state))
+            missing = _missing_profile_fields(_extract_recommendation_profile(working_state))
             fallback_questions = _clarification_questions(missing) or [
                 "어떤 계좌에서 투자할 예정인가요? IRP, DC, DB, 연금저축 중 선택해 주세요."
             ]
@@ -1318,8 +1466,9 @@ def build_product_agent_node():
                 "missing_information": [_PROFILE_FIELD_LABELS.get(f, f) for f in missing],
                 "clarification_questions": fallback_questions,
                 "response_mode": "clarification_included",
-                "repair_attempted": state.get("verification") is not None,
+                "repair_attempted": working_state.get("verification") is not None,
                 "product_fallback_used": True,
+                "resolved_product": working_state.get("resolved_product"),
             }
         messages = result["messages"]
 
@@ -1336,7 +1485,7 @@ def build_product_agent_node():
             draft = _apply_clarification_policy(draft)
         fallback_used = False
         if not retrieved_context:
-            fallback_draft, fallback_context = _fallback_product_recommendation(state)
+            fallback_draft, fallback_context = _fallback_product_recommendation(working_state)
             if fallback_context:
                 draft = fallback_draft
                 retrieved_context = fallback_context
@@ -1353,8 +1502,9 @@ def build_product_agent_node():
             "needs_clarification": needs_clarification,
             "response_mode": "clarification_included" if needs_clarification else "complete",
             "recommendation_stage": "clarification" if needs_clarification else None,
-            "repair_attempted": state.get("verification") is not None,
+            "repair_attempted": working_state.get("verification") is not None,
             "product_fallback_used": fallback_used,
+            "resolved_product": working_state.get("resolved_product"),
         }
 
     return product_agent_node

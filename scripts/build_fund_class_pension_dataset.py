@@ -29,8 +29,6 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "data" / "processed"
-DEFAULT_XLSX = Path("/Users/dapanman/Downloads/Cost_Guard_fund_class_v2_검증보정.xlsx")
-DEFAULT_PDF_ROOT = Path("/Users/dapanman/Desktop/2.연금/투자설명서")
 
 ALLOWED_ACCOUNT_TYPES = {"연금저축", "퇴직연금/IRP"}
 ALLOWED_CHANNELS = {"오프라인", "온라인", "온라인슈퍼", "직판"}
@@ -298,18 +296,30 @@ def compare_parser_to_reference(parser_rows: list[dict], reference_rows: list[di
     return results
 
 
-def canonical_rows(parser_rows: list[dict], validation_rows: list[dict]) -> list[dict]:
+def canonical_rows(
+    parser_rows: list[dict],
+    validation_rows: list[dict],
+    all_reference_rows: list[dict] | None = None,
+) -> list[dict]:
     validation_by_key = {(r["product_code"], r["class_code"]): r["validation_status"] for r in validation_rows}
     field_mismatch_by_key = {
         (r["product_code"], r["class_code"])
         for r in validation_rows
         if r["validation_status"] == "FIELD_MISMATCH"
     }
+    reference_by_key = {row_key(row): row for row in all_reference_rows or []}
     rows = []
     for row in parser_rows:
         status = validation_by_key.get(row_key(row), "EXTRA_IN_PARSER")
         if row_key(row) in field_mismatch_by_key:
             continue
+        if status == "EXTRA_IN_PARSER":
+            reference = reference_by_key.get(row_key(row))
+            if reference and (
+                reference.get("cost_guard_usable") != "Y"
+                or reference.get("account_type") not in ALLOWED_ACCOUNT_TYPES
+            ):
+                continue
         rows.append({**row, "validation_status": status})
     return rows
 
@@ -787,6 +797,13 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def repo_relative_path(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
 def build_manifest(
     coverage: dict,
     *,
@@ -900,8 +917,8 @@ def write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pdf-root", type=Path, default=DEFAULT_PDF_ROOT)
-    parser.add_argument("--xlsx", type=Path, default=DEFAULT_XLSX)
+    parser.add_argument("--pdf-root", type=Path, required=True)
+    parser.add_argument("--xlsx", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--review-csv",
@@ -920,7 +937,7 @@ def main() -> None:
     review_path = args.review_csv or args.output_dir / "fund_class_pension_review.csv"
     review_rows = read_review_rows(review_path)
     review_errors = validate_review_rows(review_rows)
-    canonical_before_review = canonical_rows(parser_rows, validation_rows)
+    canonical_before_review = canonical_rows(parser_rows, validation_rows, all_reference_rows)
     canonical = apply_review_overrides(canonical_before_review, parser_rows, validation_rows, review_rows)
     provenance_rows = review_provenance_rows(canonical_before_review, canonical, review_rows)
     errors = validate_canonical_rows(canonical)
@@ -941,7 +958,7 @@ def main() -> None:
     coverage["p0_review_required_case_count"] = p0_case_count
     coverage["p0_review_required_field_row_count"] = len(p0_template)
     coverage["p0_review_unresolved_field_row_count"] = len(unresolved_p0)
-    coverage["review_override_path"] = str(review_path)
+    coverage["review_override_path"] = repo_relative_path(review_path)
     coverage["review_override_count"] = len(review_rows)
     coverage["canonical_row_count_before_review"] = len(canonical_before_review)
     coverage["canonical_row_count_delta_from_review"] = len(canonical) - len(canonical_before_review)

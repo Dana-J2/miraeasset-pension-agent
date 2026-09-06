@@ -18,6 +18,8 @@
 
 import re
 
+from src.agents.context import CLARIFICATION_MARKER
+
 # "숫자+단위" 토큰만 추출한다. 단위 후보는 연금 도메인에서 사실 주장에 쓰이는 것들로 한정:
 # 금액(억원/만원/천원/원, 맨 억/만), 비율(%/퍼센트/프로), 나이(세), 기간(년/개월), 위험등급(등급).
 # '세'는 세금/세율/세액/세대 같은 복합어 오탐을 막기 위해 뒤 글자를 제한한다.
@@ -51,7 +53,15 @@ _NUMERIC_CORE_RE = re.compile(r"[\d,\.]+(?:\s?/\s?[\d,\.]+)?")
 #
 # 정규식에 서식 문자를 하나씩 끼워 넣는 대신(새 서식마다 땜질이 필요하다) 검사 전에
 # 서식을 제거한다 — L0가 봐야 하는 것은 표기가 아니라 수치 그 자체다.
-_INLINE_MARKUP_RE = re.compile(r"[*_`~]+")
+#
+# ⚠️ '~'는 취소선(~~) 서식이기도 하지만 한국어에서 **범위 표기**로 훨씬 자주 쓰인다
+# ("5~6등급", "55~70세", "3.3~5.5%"). 무조건 지우면 범위의 양끝이 붙어 존재하지 않는
+# 수치가 만들어진다 — 실측(S02): 답변 초안의 "위험등급 5~6등급"이 "56등급"으로 뭉개져
+# L0가 "근거에 없는 수치 56등급"이라고 확정했다(근거에 있을 수가 없는 유령 값이다).
+# 그래서 숫자 사이에 낀 단일 '~'는 범위 구분자로 보고 보존하며, 취소선으로 쓰인
+# '~~'만 제거한다.
+_STRIKETHROUGH_RE = re.compile(r"~~+")
+_INLINE_MARKUP_RE = re.compile(r"[*_`]+")
 
 
 def strip_inline_markup(text: str) -> str:
@@ -59,8 +69,32 @@ def strip_inline_markup(text: str) -> str:
 
     서식은 의미가 아니라 표현이므로, 근거 대조 전에 걷어내야 "**16.5**%"와 "16.5%"가
     같은 사실로 취급된다. 원문을 바꾸지 않고 검사용 사본에만 적용한다.
+
+    단, 범위 표기의 '~'("5~6등급")는 서식이 아니라 의미라서 보존한다 — 지우면
+    양끝이 붙어 "56등급" 같은 유령 수치가 생긴다.
     """
-    return _INLINE_MARKUP_RE.sub("", text or "")
+    return _INLINE_MARKUP_RE.sub("", _STRIKETHROUGH_RE.sub("", text or ""))
+
+
+# 범위 표기에서 **앞쪽 수치는 단위가 없어** 토큰 정규식에 잡히지 않는다
+# ("5~6등급"의 5, "3.3~5.5%"의 3.3, "55~70세"의 55). 뒤쪽 단위를 앞쪽에도 나눠 붙여
+# 양끝을 모두 검사 대상으로 만든다 — 안 그러면 범위의 앞 숫자를 지어내도 L0가 놓친다.
+_NUMBER_RANGE_RE = re.compile(
+    r"(\d[\d,]*(?:\.\d+)?)\s*[~∼－-]\s*(\d[\d,]*(?:\.\d+)?\s?"
+    r"(?:억\s?원|만\s?원|천\s?원|억(?![가-힣])|만(?![가-힣])|원|%|퍼센트|프로"
+    r"|세(?![금율액대])|년|개월|등급))"
+)
+
+
+def _expand_number_ranges(text: str) -> str:
+    """'5~6등급'을 '5등급~6등급'처럼 펼쳐 양끝 모두 토큰으로 잡히게 한다."""
+
+    def _sub(match: re.Match) -> str:
+        head, tail = match.group(1), match.group(2)
+        unit = re.sub(r"^\d[\d,]*(?:\.\d+)?\s?", "", tail)
+        return f"{head}{unit}~{tail}"
+
+    return _NUMBER_RANGE_RE.sub(_sub, text)
 
 
 def extract_number_tokens(text: str) -> list[str]:
@@ -70,7 +104,7 @@ def extract_number_tokens(text: str) -> list[str]:
     수치가 통째로 검사에서 빠져나간다.
     """
     seen: list[str] = []
-    for m in _NUMBER_TOKEN_RE.finditer(strip_inline_markup(text)):
+    for m in _NUMBER_TOKEN_RE.finditer(_expand_number_ranges(strip_inline_markup(text))):
         token = m.group(0).strip()
         if token not in seen:
             seen.append(token)
@@ -289,6 +323,41 @@ def has_limit_disclosure(answer: str) -> bool:
     return any(marker in (answer or "") for marker in _LIMIT_DISCLOSURE_MARKERS)
 
 
+# "[추가 확인 필요]" 마커 앞에 실질적인 본문이 있는지 볼 때 쓰는 최소 길이. 짧은
+# 서두 문장("현재 정보로는 답변이 어렵습니다")만 있고 바로 역질문으로 넘어가는
+# 답변과, 실제 일반 기준을 담은 답변을 구분하는 데 쓴다. 임의의 기준이지만
+# 근사치면 충분하다 — 이 함수는 강제(자동 생성)가 아니라 관측용이다.
+_MIN_GUIDANCE_BODY_LENGTH = 80
+
+
+def has_general_guidance(answer: str) -> bool:
+    """역질문 답변에 '지금 답할 수 있는 일반 기준'이 함께 있는지 판정한다.
+
+    ⚠️ 이 함수는 **관측 전용**이다 — 판정 결과로 답변을 고치거나 새 내용을
+    만들어 붙이지 않는다. info_agent의 프롬프트 지시("일반 기준을 먼저 쓰고
+    역질문은 그다음")가 실제로 지켜졌는지 think_trace에 남겨, 사후에 위반 빈도를
+    셀 수 있게 하는 용도다.
+
+    없는 내용을 코드가 지어내 채우면 이 프로젝트가 하루 종일 고쳐온 바로 그
+    할루시네이션 문제를 이 자리에 새로 만드는 셈이라, 강제하지 않는다
+    (product_agent 경로는 반대로 근거 상수만 재사용하는 _general_guidance_block으로
+    코드가 직접 조립한다 — 그쪽은 생성이 아니라 결정론적 조립이라 안전하다. LLM이
+    자유 텍스트로 쓰는 info_agent 경로는 사후에 지어낼 수 없으므로 관측만 한다).
+
+    판정 기준: "[추가 확인 필요]" 마커가 있는 답변에서, 마커 앞부분에 한계 고지가
+    아닌 실질적인 문장이 일정 길이 이상 있으면 일반 기준이 포함된 것으로 본다.
+    """
+    text = answer or ""
+    if CLARIFICATION_MARKER not in text:
+        return True  # 애초에 역질문이 아니면 이 판정 대상이 아니다 — 위반 아님
+    body = text.split(CLARIFICATION_MARKER, 1)[0].strip()
+    if has_limit_disclosure(body) and len(body) < _MIN_GUIDANCE_BODY_LENGTH:
+        # "자료에 없어 확인이 어렵습니다" 한 줄만 있고 본문이 짧으면, 이는 정당한
+        # 근거 부재 고지이지 일반 기준 누락이 아니다(프롬프트도 이 경우는 허용한다).
+        return True
+    return len(body) >= _MIN_GUIDANCE_BODY_LENGTH
+
+
 def has_premise_correction(answer: str) -> bool:
     """답변이 질문의 잘못된 전제를 바로잡는 문장을 담고 있는지 판정한다."""
     return any(marker in (answer or "") for marker in _PREMISE_CORRECTION_MARKERS)
@@ -373,21 +442,127 @@ def _number_is_asserted(answer: str, number_token: str) -> bool:
         start = idx + len(core)
 
 
+# 문장 분리 — 마침표·물음표·느낌표 뒤 공백, 또는 줄바꿈을 경계로 본다.
+# 목록 항목("- 2013년 3월 1일 이후...")도 줄 단위로 하나의 문장처럼 다룬다.
+#
+# ⚠️ 숫자 뒤 마침표("1.", "2.")는 문장 끝이 아니라 번호 매기기 표기다. 구분 없이
+# 자르면 "1. **세금**: 중도인출 시 16.5%..." 같은 줄이 ["1.", "**세금**: ..."]로
+# 갈라져, "번호 다음 첫 조각만 보존" 규칙이 번호("1.")만 지키고 정작 지켜야 할
+# 제목+본문 전체를 삭제 대상으로 넘겨버린다(실측 회귀: no.140 케이스가
+# "1.\n2. ...\n3. ..."로 깨졌다 — 1번 항목 제목까지 통째로 사라짐).
+# 숫자 바로 뒤의 마침표에서는 자르지 않는다("1." 뒤가 아니라 "1. 문장" 전체를 한
+# 조각으로 유지) — (?<!\d\.)는 매치 지점 앞 두 글자가 "숫자+마침표"인지 본다.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<!\d\.)(?<=[.!?])\s+")
+
+# 번호 목록 항목("1. ", "  2. "). 이런 줄은 통째로 보존한다 — 한 항목만 지우면
+# 번호가 어긋나고, 다시 매기면 원문 서식을 더 훼손한다.
+_NUMBERED_ITEM_RE = re.compile(r"^[ \t]*\d+\.[ \t]+\S")
+
+# 이 표현이 문장에 있으면 삭제하지 않는다 — 수치를 부정·교정하거나 한계를 고지하는
+# 문장은 지우면 오히려 정확한 정보가 사라진다.
+_SENTENCE_KEEP_MARKERS = _NUMBER_NEGATION_MARKERS + _LIMIT_DISCLOSURE_MARKERS
+
+
+def _drop_sentences_with_numbers(answer: str, leaked: list[str]) -> tuple[str, list[str]]:
+    """확정된 미지원 수치를 '사실로 주장하는 문장'만 통째로 제거한다.
+
+    반환값은 (정리된 답변, 실제로 제거하지 못해 남은 수치들)이다.
+
+    ⚠️ 왜 문장 단위인가: 수치만 지우면 문장이 깨진다("연금소득세율은 %입니다").
+    문장을 통째로 들어내면 나머지 문장은 온전하다. 실측으로 확인한 결과 지어낸
+    주장은 한 문장에 고립돼 있었다 —
+      no.27  "...평균 임금의 60% 이상으로 계산된다는 규정이 있으나..."  (10문장 중 1개)
+      no.56  "- 2013년 3월 1일 이후 가입한 연금 계좌의 자금을..."       (19문장 중 1개)
+    둘 다 근거에 없는 규정을 사실처럼 서술한 문장이고, 지워도 답변의 나머지 설명은
+    그대로 성립한다.
+
+    ⚠️ 보수적으로 동작한다 — 다음 경우에는 지우지 않고 기존처럼 경고만 붙인다:
+      - 부정·교정 문맥("60%가 아니라")이나 한계 고지 문맥의 문장
+      - 그 문장을 지우면 본문이 거의 남지 않는 경우(문장이 1~2개뿐인 짧은 답변)
+    답변을 과하게 훼손하는 것은 할루시네이션 못지않게 나쁘기 때문이다.
+    """
+    body, separator, tail = answer.partition("참고 근거:")
+    kept_lines: list[str] = []
+    removed_numbers: set[str] = set()
+    for line in body.split("\n"):
+        is_numbered_item = bool(_NUMBERED_ITEM_RE.match(line))
+        # 번호 목록 항목의 **번호와 소제목**(보통 "1. **연금 저축**: ...")은 통째로
+        # 지우지 않는다 — 한 항목을 완전히 비우면 번호가 어긋나고, 다시 매기면
+        # 원문 서식을 더 훼손한다(실측 no.140). 그러나 "번호 목록이니 무조건
+        # 보존"으로 두면 반대 사고가 난다 — 실측 T04: 항목 본문 전체가 지어낸
+        # 수치("연간 최대 400만원까지...")였는데 줄째로 보존돼 방어가 무력화됐다.
+        # 그래서 번호 목록 줄도 **문장 단위로는** 검사하되, 번호 다음 첫 조각
+        # (제목)만 무조건 남긴다.
+        pieces = _SENTENCE_SPLIT_RE.split(line)
+        kept_pieces: list[str] = []
+        for index, piece in enumerate(pieces):
+            if is_numbered_item and index == 0:
+                kept_pieces.append(piece)
+                continue
+            target = next(
+                (
+                    n
+                    for n in leaked
+                    if _numeric_core(n) in strip_inline_markup(piece).replace(",", "")
+                ),
+                None,
+            )
+            if target is not None and not any(m in piece for m in _SENTENCE_KEEP_MARKERS):
+                removed_numbers.add(target)
+                continue
+            kept_pieces.append(piece)
+        if pieces and not kept_pieces:
+            continue  # 줄 전체가 지어낸 내용이면 줄째로 뺀다
+        kept_lines.append(" ".join(p for p in kept_pieces if p).strip())
+
+    if not removed_numbers:
+        return answer, leaked
+
+    # 남은 분량은 **문장 수**로 센다. 줄 수로 세면 여러 문장이 한 줄에 있는 답변에서
+    # "1줄이니 너무 짧다"고 오판해 삭제가 통째로 무산된다.
+    def _sentence_count(text: str) -> int:
+        return len([s for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()])
+
+    kept_sentences = _sentence_count("\n".join(kept_lines))
+    original_sentences = _sentence_count(body)
+    # 본문이 절반 넘게 사라지거나 거의 남지 않으면 삭제하지 않는다 — 지나친 훼손은
+    # 할루시네이션 못지않게 나쁘므로 경고로 물러선다.
+    if kept_sentences < 2 or kept_sentences * 2 < original_sentences:
+        return answer, leaked
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(kept_lines)).strip()
+    still_leaked = [n for n in leaked if n not in removed_numbers]
+    return f"{cleaned}\n\n{separator}{tail}" if separator else cleaned, still_leaked
+
+
 def enforce_unsupported_numbers(answer: str, confirmed: list[str]) -> str:
-    """④가 '근거에 없다'고 확정한 수치가 최종 답변에 사실로 남아 있으면 경고를 붙인다.
+    """④가 '근거에 없다'고 확정한 수치를 최종 답변에서 제거하거나, 못 지우면 경고를 붙인다.
 
     ⑤ 프롬프트에 이 목록을 넘기고 "쓰지 말라"고 부탁하지만(generator.py), 그 실측
     4/4 위반이 이 프로젝트가 "프롬프트 순종은 확률적으로 실패한다"는 원칙을 세운
     근거였다 — missing_requirements/premise_issues는 이미 코드로 강제하면서 정작
     grounded=False의 핵심 증거인 unsupported_numbers_confirmed는 강제가 없었다.
 
-    수치를 코드로 지우면 문장이 깨진다("연금소득세율은 %입니다") — 그래서 삭제 대신
-    경고를 붙인다. 이미 부정 문맥으로 쓰였다면(수치를 틀렸다고 바로잡는 중) 손대지
-    않는다 — 그건 할루시네이션이 아니라 올바른 답변이다.
+    ⚠️ 예전에는 경고만 붙이고 본문은 그대로 뒀다("수치를 지우면 문장이 깨진다"는
+    이유). 그러나 사용자는 본문을 먼저 읽고 경고는 맨 아래에 있어, **처음 읽을 때는
+    지어낸 값을 사실로 받아들인다.** 실측:
+      no.27 "평균 임금의 60% 이상으로 계산된다는 규정"  (근거에 없는 계산식)
+      no.56 "2013년 3월 1일 이후 가입한 계좌는 이전 불가"  (근거에 없는 규정)
+      실사용 "연간 최대 700만원까지 세액공제"            (2023년 폐지된 한도)
+    수치만 지우면 문장이 깨지는 것은 맞지만, **문장을 통째로 들어내면** 나머지는
+    온전하다. 그래서 문장 단위 제거를 먼저 시도하고, 안전하지 않으면 경고로 물러선다.
+
+    이미 부정 문맥으로 쓰였다면(수치를 틀렸다고 바로잡는 중) 손대지 않는다 — 그건
+    할루시네이션이 아니라 올바른 답변이다.
     """
     leaked = [n for n in confirmed if _number_is_asserted(answer, n)]
     if not leaked:
         return answer
+
+    answer, leaked = _drop_sentences_with_numbers(answer, leaked)
+    if not leaked:
+        return answer
+
     items = ", ".join(dict.fromkeys(leaked))
     return (
         f"{answer}\n\n"
@@ -422,9 +597,16 @@ _USER_PREMISE_MARKERS = (
 # ④가 "초안/질문이 ~하다"처럼 답변 과정을 서술하는 주어. 이게 등장하면 사용자 발화가
 # 아니라 시스템 내부 상태를 말하는 것이다.
 _META_SUBJECT_MARKERS = ("초안", "답변이", "답변은", "질문은", "질문이")
+# ⚠️ "이라는 전제"·"라는 전제"는 여기 두면 안 된다(제거 이력). "전제"는 ④가 **모든**
+# premise 항목에 붙이는 일반 용어라, 조건 되뇜과 진짜 오류를 전혀 구분하지 못한다.
+# 게다가 "이라는/라는"은 앞 명사의 받침 유무로 갈리는 조사일 뿐이라, 판정이 의미가
+# 아니라 철자에 좌우됐다:
+#   "IRP는 원금보장 상품이라는 전제"   -> 필터링(진짜 오류인데 사라짐)
+#   "중도인출이 가능하다는 전제"        -> 유지
+# 실측: 이 마커 때문에 진짜 전제 오류 5개 중 4개가 조용히 걸러졌다(IRP 원금보장,
+# 위험등급 6등급, DB형 중도인출, 폐지된 700만원 한도). 원래 의도했던 "사용자가 준
+# 조건을 되뇐 항목"(잔금지급일 2026-01-31 등)은 아래 숫자 분기가 이미 전부 커버한다.
 _BENIGN_CONDITION_MARKERS = (
-    "이라는 전제",
-    "라는 전제",
     "이라고 가정",
     "라고 가정",
     "나이가",
@@ -437,6 +619,83 @@ _BENIGN_CONDITION_MARKERS = (
     "개인워크아웃",
 )
 _FALSE_PREMISE_MARKERS = ("사실과 다", "과장", "잘못", "오해", "자유롭", "무조건", "반드시")
+
+
+# 사용자의 요청·목표·선호·희망을 서술하는 종결 표현. premise_issues는 "참·거짓을 따질 수
+# 있는 사실 주장"만 담아야 하는데, ④가 사용자의 **바람**을 여기에 넣는 사고가 반복됐다.
+#
+# 실측 2건(같은 클래스, 표현만 다름):
+#   "안정적인 것을 원한다"        (Q-4 "솔로몬 국공채... 안정적인 걸 원해요")
+#   "노후를 위한 절세 방법이 필요함" ("65세 정년퇴직... 절세를 많이 하고 싶어")
+# 둘 다 최종 답변이 "다음 내용은 사실과 다르거나 과장된 부분이 있어 그대로 전제하기
+# 어렵습니다: 노후를 위한 절세 방법이 필요함"으로 시작해 사용자의 요청을 반박했다.
+#
+# 개별 문구를 _BENIGN_CONDITION_MARKERS에 추가하는 방식으로는 못 막는다 — 1차 사고 뒤에도
+# 표현만 바뀐 2차 사고가 났다. 어휘가 아니라 **문장의 종류**로 판정한다: 욕구·필요·의향
+# 서술어는 유한한 문법 범주라 어휘 목록보다 표현 변형에 견고하다.
+_WANT_STATEMENT_ENDINGS = (
+    "원한다", "원함", "원해", "원하심", "원하십니다",
+    "하고싶다", "하고싶음", "하고싶어", "싶다", "싶음", "싶어", "싶어함", "싶어한다",
+    "필요하다", "필요함", "필요해", "필요로한다", "필요성",
+    "바란다", "바람", "희망한다", "희망함", "희망",
+    "요청", "요청함", "문의", "문의함", "알고싶다", "알고싶음",
+    # 명령형 요청 어미. 실측(20문항 스팟체크 T08/T09): "안정적인 상품 추천해줘",
+    # "공격적으로 투자하고 싶은데 뭐가 좋을까요?"가 endings에 안 걸려 요청 자체가
+    # "사실과 다르거나 과장된 전제"로 오분류됐다 — 최종 답변이 사용자의 요청 문장을
+    # 그대로 반박하는 문장으로 시작했다. "원해/싶어" 같은 욕구 서술어만 있고
+    # "-해줘/-주세요" 명령형·"-줄래요"류 청유형이 빠져 있었다.
+    "해줘", "해주세요", "해주십시오", "줄래", "줄래요", "부탁해", "부탁드립니다",
+    "부탁드려요", "추천해줘", "추천해주세요", "추천해주십시오", "알려줘", "알려주세요",
+    # "~하고 싶은데 뭐가 좋을까요?"처럼 선호를 물으며 상품을 청하는 의문형 종결.
+    "좋을까요", "좋을까요?", "좋을지", "나을까요", "나을까요?",
+    # "뭐부터 시작해야 하나요?"류 — 무엇을 해야 할지 묻는 순수 정보 요청.
+    # 실측(20문항 스팟체크 T04): "노후 대비 뭐부터 시작해야 하나요?"가 최종 답변에서
+    # "다음 내용은 사실과 다르거나 과장된 부분이 있어..."로 반박당했다. 이 문장은
+    # 참·거짓을 따질 수 있는 주장이 아니라 순수한 방법 질의다.
+    "해야하나요", "해야하나요?", "해야할까요", "해야할까요?", "사야하나요", "사야하나요?",
+)
+
+
+def is_want_statement(text: str) -> bool:
+    """사용자의 요청·목표·선호를 담은 문장인지(= 참·거짓이 없는 진술인지) 판정한다.
+
+    사용자가 무언가를 원한다는 사실 자체는 틀릴 수가 없으므로, 이런 항목은 "잘못된
+    전제"가 될 수 없다. 종결부로 판정한다 — "노후를 위한 절세 방법이 필요함"처럼
+    명사구로 끝나도 마지막 서술어가 욕구·필요를 나타내면 요청 진술이다.
+
+    ⚠️ 호출부는 _FALSE_PREMISE_MARKERS("사실과 다"·"과장"·"잘못" 등)를 먼저 확인해야
+    한다 — "안전하다고 잘못 알고 원함"처럼 사실 주장이 섞인 항목까지 걷어내면 진짜
+    전제 오류를 놓친다.
+    """
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return False
+    return any(compact.endswith(ending) for ending in _WANT_STATEMENT_ENDINGS)
+
+
+# "제도가 이렇게 작동한다"는 주장에 쓰이는 서술어. 사용자가 준 **자기 조건**(잔금지급일,
+# 본인 나이, 수령연차)과 **제도에 대한 주장**(원금보장이다, 중도인출이 된다, 한도가 얼마다)을
+# 가르는 신호다. 전자는 되뇜이라 교정 대상이 아니고, 후자는 틀렸으면 반드시 바로잡아야 한다.
+_INSTITUTIONAL_CLAIM_MARKERS = (
+    "위험하", "안전하", "가능하", "불가능", "된다", "안된다", "안 된다",
+    "보장", "유리", "불리", "면제", "비과세", "과세되", "적용되", "허용",
+    "높다", "낮다", "같다", "다르다", "이다", "입니다",
+)
+# 제도의 기준값을 주장하는 표현. 사용자 조건은 "내 상황이 얼마"이고, 제도 주장은
+# "규정상 얼마"다 — 후자는 숫자가 들어 있어도 검증 대상이다.
+_INSTITUTIONAL_VALUE_MARKERS = ("한도", "기준", "요건", "세율", "공제율", "등급")
+
+
+def asserts_institutional_rule(text: str) -> bool:
+    """항목이 "제도가 이렇게 작동한다"는 주장인지(= 참·거짓 검증 대상인지) 판정한다.
+
+    사용자가 제시한 자기 조건("잔금지급일이 2026년 1월 31일")과 구분하기 위한 것이다.
+    조건 되뇜은 값을 그대로 옮길 뿐이지만, 제도 주장은 그 값이나 성질이 **맞는지 틀리는지**를
+    말한다 — 틀렸다면 답변 앞머리에서 바로잡아야 하는 바로 그 대상이다.
+    """
+    return any(marker in text for marker in _INSTITUTIONAL_CLAIM_MARKERS) or any(
+        marker in text for marker in _INSTITUTIONAL_VALUE_MARKERS
+    )
 
 
 def is_answer_defect_statement(text: str) -> bool:
@@ -460,6 +719,17 @@ def is_benign_condition_statement(text: str) -> bool:
     제도 전제는 유지한다.
     """
     if any(marker in text for marker in _FALSE_PREMISE_MARKERS):
+        return False
+    # 사용자의 요청·목표·선호는 참·거짓이 없으므로 교정 대상이 될 수 없다.
+    # (_FALSE_PREMISE_MARKERS 확인 뒤에 둔다 — 사실 주장이 섞였으면 그쪽이 우선)
+    if is_want_statement(text):
+        return True
+    # "제도가 이렇게 작동한다"는 주장은 사용자가 준 조건이 아니라 검증 대상이다.
+    # 아래 무해 분기들(숫자 포함, 중도인출 문맥 등)보다 먼저 확인해야 한다 — 그 분기들은
+    # 주제어만 보므로 제도 주장까지 함께 삼킨다(실측: "연금저축 한도가 700만원이라는
+    # 전제"가 숫자+"연금" 조합으로, "DB형도 중도인출이 된다는 전제"가 "DB형" 마커로
+    # 무해 처리돼 폐지된 한도·틀린 제도 이해를 교정하지 못했다).
+    if asserts_institutional_rule(text):
         return False
     if re.search(r"\d", text) and any(
         marker in text
@@ -804,6 +1074,122 @@ def apply_requirement_scope_override(
     return result
 
 
+# 세제 효과를 과장하는 유도성 표현 + 그 표현이 인용임을 드러내는 어미.
+# 대회 요강 평가지표 "정확성"이 명시적으로 요구하는 항목이다 — "고객의 잘못된 전제나
+# 유도성 질문을 그대로 수용하지 않고 바로잡는가". 요강의 참고 질의에도
+# "명퇴수당을 연금계좌에 넣으면 세금 감면이 어마어마하다던데"가 예시로 들어 있다.
+_EXAGGERATED_TAX_CLAIM_MARKERS = (
+    "어마어마", "엄청", "무제한", "완전히 안", "하나도 안", "거의 안", "안 낸다", "안낸다",
+    "전혀 안", "공짜", "면제된다",
+)
+# "세금이 없다"/"세금도 없다"/"세금 없다"처럼 조사만 달라지는 형태를 하나로 잡는다 —
+# 조사를 리터럴로 하나씩 늘리면 표현이 조금만 달라져도 계속 뚫린다(실측: "세금도 없다던데"가
+# "세금이 없"·"세금 없" 두 마커를 모두 비껴갔다).
+_NO_TAX_CLAIM_RE = re.compile(r"세금[이가도는을]?없")
+# 사용자가 남의 말을 옮기는 어미 — 이게 있으면 본인 주장이 아니라 "들은 이야기"라
+# 확인을 구하는 것이므로, 바로잡아 주는 것이 정확히 요강이 요구하는 대응이다.
+_HEARSAY_ENDINGS = ("다던데", "라던데", "다는데", "라는데", "다고 하", "라고 하", "들었", "맞나요", "맞죠", "사실인가요")
+_TAX_TOPIC_MARKERS = ("세금", "세액공제", "절세", "감면", "과세", "세율", "혜택")
+
+
+def detect_exaggerated_tax_premise(question: str) -> list[str]:
+    """질문에 담긴 "세금이 거의 없다"류 과장 전제를 결정론적으로 찾아낸다.
+
+    ⚠️ 결정론 답변 경로는 ④grounding을 건너뛰므로(불필요한 repair 47/184건을 막기
+    위한 의도된 우회), premise_issues가 항상 빈 리스트로 고정된다. 그 부작용으로
+    **전제 교정이 결정론 경로에서 아예 작동하지 않았다** — 실측 T18("퇴직금 받아서
+    연금으로 굴리면 세금 거의 안 낸다던데 맞나요?")과 요강 참고질의("세금 감면이
+    어마어마하다던데")가 모두 이 경로라 과장을 그대로 통과시켰다.
+
+    LLM을 다시 부르지 않고 코드로 잡는다 — 우회의 이점(속도·비용·불필요한 repair 제거)을
+    유지하면서 교정만 되살리는 방법이다. 과장 표현 + 세금 주제 + 인용 어미가 모두
+    있을 때만 잡아 오탐을 억제한다(본인이 단정하는 게 아니라 "들었다"고 확인을 구하는
+    형태여야 한다).
+    """
+    compact = re.sub(r"\s+", "", question or "")
+    if not compact:
+        return []
+    has_exaggeration = any(
+        re.sub(r"\s+", "", m) in compact for m in _EXAGGERATED_TAX_CLAIM_MARKERS
+    ) or _NO_TAX_CLAIM_RE.search(compact) is not None
+    has_tax_topic = any(m in compact for m in _TAX_TOPIC_MARKERS)
+    has_hearsay = any(re.sub(r"\s+", "", m) in compact for m in _HEARSAY_ENDINGS)
+    if has_exaggeration and has_tax_topic and has_hearsay:
+        return [
+            "연금계좌의 세제 혜택이 세금을 거의 내지 않아도 될 만큼 크다는 전제"
+        ]
+    return []
+
+
+# ④의 issues 항목이 "근거 없이 단정했다"는 지적인지 판정하는 표현.
+_UNSUPPORTED_CLAIM_MARKERS = (
+    "근거 없", "근거가 없", "근거 부족", "근거가 부족", "뒷받침되지",
+    "근거 없이", "확인되지 않", "제공된 근거 없",
+)
+# 위 표현이 있어도 이 표현이 함께 있으면 "문제 없다"는 서술이다 — ④가 issues 칸에
+# 검토 결과를 그대로 적는 경우가 있다(실측 no.446 "구체적인 수치나 단정적인 주장을
+# 포함하지 않으므로, 이 부분은 문제가 없습니다").
+_ISSUE_BENIGN_MARKERS = (
+    "문제가 없", "문제없", "일치하므로", "위반이 아니", "해당하지 않습니다",
+    "포함하지 않으므로", "적절합니다", "타당합니다",
+)
+# ④가 issues에 "답변이 빠뜨렸다"를 적는 경우 — 성격상 요구사항 미충족이라
+# enforce_missing_requirements가 담당한다. 여기서 중복 고지하면 안 된다.
+_ISSUE_OMISSION_MARKERS = (
+    "답변하지 않", "다루지 않", "제공하지 않", "언급하지 않", "직접적으로 답",
+)
+
+
+def _is_unsupported_claim_issue(issue: str) -> bool:
+    """issues 항목이 '근거 없는 단정'을 지적한 것인지 판정한다."""
+    if any(marker in issue for marker in _ISSUE_BENIGN_MARKERS):
+        return False
+    if any(marker in issue for marker in _ISSUE_OMISSION_MARKERS):
+        return False
+    return any(marker in issue for marker in _UNSUPPORTED_CLAIM_MARKERS)
+
+
+def enforce_unsupported_claims(answer: str, issues: list[str]) -> str:
+    """④가 '근거 없이 단정했다'고 지적한 서술에 대해 한계를 고지한다.
+
+    ## 왜 필요한가
+
+    ④의 출력 중 issues만 **코드 강제가 전혀 없었다**. unsupported_numbers_confirmed·
+    missing_requirements·premise_issues에는 각각 enforce_* 가 있는데, issues는 ⑤
+    프롬프트에 넘기고 "반영해달라"고 부탁만 했다 — 이 프로젝트가 반복 확인한
+    "프롬프트 순종은 확률적으로 실패한다"가 그대로 적용되는 자리다.
+
+    실측(501문항): grounded=False 46건 중 32건이 "확정 수치는 없고 issues만 있는"
+    경우였고, 그중 근거 없는 단정을 지적했는데 답변에 한계 고지가 없는 사례가 6건이었다.
+      no.9   "퇴직연금 규약 변경 시 고용노동부 승인 필요성에 대한 근거 부족"
+      no.48  "포트폴리오형으로 간주된다는 내용은 근거 없이 단정적으로 서술됨"
+      no.324 "배우자 명의 납입 시 세액공제가 안 된다는 정보는 제공된 근거 없이 작성됨"
+    수치가 아니라 **서술**이라 L0 수치 대조로는 잡히지 않는 유형이다.
+
+    ## 왜 문장을 지우지 않고 고지만 하는가
+
+    수치는 토큰 대조로 위치를 특정할 수 있지만, "근거 없는 단정"은 ④가 자연어로
+    서술할 뿐 답변의 **어느 문장인지 알 수 없다**. 위치를 모른 채 지우면 맞는 내용을
+    지울 위험이 크므로, 삭제 대신 한계를 고지해 사용자가 판단할 수 있게 한다.
+
+    ⚠️ issues는 ④가 자유 서술로 적는 칸이라 성격이 섞여 있다(실측 32건 중 2건은
+    "문제가 없다"는 서술, 10건은 답변 누락 지적). 그래서 세 겹으로 거른다:
+    무해 서술 제외, 누락 지적 제외(enforce_missing_requirements 담당), 그리고
+    이미 한계를 고지한 답변에는 덧붙이지 않는다.
+    """
+    if not issues or has_limit_disclosure(answer):
+        return answer
+    flagged = [issue for issue in issues if _is_unsupported_claim_issue(issue)]
+    if not flagged:
+        return answer
+    items = "".join(f"\n- {issue}" for issue in flagged)
+    return (
+        f"{answer}\n\n"
+        f"※ 위 답변 중 다음 내용은 제공된 자료에서 확인되지 않아 참고용으로만 봐주세요:{items}\n"
+        "정확한 내용은 가입하신 금융기관에 확인해 주시기 바랍니다."
+    )
+
+
 def enforce_premise_issues(answer: str, premise_issues: list[str]) -> str:
     """④가 짚은 '질문의 잘못된 전제'를 답변이 바로잡지 않았으면 앞머리에 교정문을 붙인다.
 
@@ -899,3 +1285,46 @@ def strip_tool_call_artifacts(answer: str) -> str:
         return answer
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+# ── 제도 용어 오표기 교정 ────────────────────────────────────────────────────
+#
+# 연금 제도명의 영문 표기는 법령으로 고정돼 있다(DB=Defined Benefit, DC=Defined
+# Contribution). 그런데 LLM이 약어를 풀어 쓰면서 **그럴듯하지만 틀린 단어**를
+# 끼워 넣는 일이 있다.
+#
+# 실측(501문항 no.1 "DC와 DB, 퇴직금이 정해지는 방식이랑 운용 주체가 어떻게
+# 다른가요?"): "DC(Dividend Contribution)형"이라고 썼다. Dividend는 '배당'이라
+# 확정기여와 아무 관련이 없고, 근거 문서에는 정확한 표기가 있었는데도 창작했다.
+# 전수 확인 결과 Defined Contribution 8회(정상) 대 Dividend Contribution 2회(오기)로,
+# 체계적 오류가 아니라 확률적으로 튀는 유형이다 — 즉 프롬프트로는 막기 어렵다.
+#
+# 수치 검증(L0)은 숫자만 보므로 이 오류를 구조적으로 못 잡는다. 제도명은 근거와
+# 무관하게 **정답이 하나로 고정**돼 있어 코드로 교정해도 안전하다.
+#
+# ⚠️ 여기 담는 것은 "틀린 표기 -> 옳은 표기"가 1:1로 확정되는 것만이다. 문맥에
+# 따라 달라질 수 있는 표현은 넣지 않는다 — 잘못 고치면 오히려 정확한 답변을
+# 훼손한다.
+_TERM_CORRECTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # DC = 확정기여(Defined Contribution). Dividend/Definite 등으로 잘못 쓰는 사례.
+    (re.compile(r"Dividend\s+Contribution", re.IGNORECASE), "Defined Contribution"),
+    (re.compile(r"Definite\s+Contribution", re.IGNORECASE), "Defined Contribution"),
+    # DB = 확정급여(Defined Benefit).
+    (re.compile(r"Definite\s+Benefit", re.IGNORECASE), "Defined Benefit"),
+    (re.compile(r"Defined\s+Benefits\b"), "Defined Benefit"),
+    # IRP = 개인형 퇴직연금(Individual Retirement Pension).
+    (re.compile(r"Individual\s+Retirement\s+Plan\b", re.IGNORECASE), "Individual Retirement Pension"),
+)
+
+
+def correct_institution_terms(answer: str) -> str:
+    """제도명 영문 표기 오류를 교정한다 (DC=Defined Contribution 등).
+
+    법령상 표기가 하나로 고정된 용어만 다루므로, 근거를 확인하지 않고 치환해도
+    안전하다. 답변의 다른 내용은 건드리지 않는다.
+    """
+    if not answer:
+        return answer
+    for pattern, correct in _TERM_CORRECTIONS:
+        answer = pattern.sub(correct, answer)
+    return answer

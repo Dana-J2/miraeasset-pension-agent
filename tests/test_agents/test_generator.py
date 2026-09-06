@@ -95,7 +95,7 @@ def test_enforce_replaces_placeholders_and_appends_reference_line():
 
     assert "[근거" not in out
     assert "doc41 세액공제 규칙" in out
-    assert "참고 근거:" in out
+    assert "📎 참고 근거" in out
 
 
 def test_enforce_leaves_clean_answer_untouched_except_reference():
@@ -105,7 +105,10 @@ def test_enforce_leaves_clean_answer_untouched_except_reference():
     answer = "연금저축과 IRP 합산 세액공제 한도는 900만원입니다.\n\n참고 근거: doc41"
     out = _enforce_verification(answer, {"missing_requirements": [], "premise_issues": []}, _ctx("doc41"))
 
-    assert out == answer
+    assert "연금저축과 IRP 합산 세액공제 한도는 900만원입니다." in out
+    assert "참고 근거:" not in out
+    assert "📎 참고 근거" in out
+    assert "[1] doc41" in out
 
 
 # ── ④가 확정한 근거 없는 수치가 답변에 남으면 경고 (500문항 실측) ─────────
@@ -302,7 +305,35 @@ def test_finalize_answer_appends_single_guardian_block_and_reference():
 
     assert "필요서류는 다음과 같습니다." in out
     assert out.count("🛡️ 파수꾼 체크") == 1
-    assert "참고 근거: core-doc; guard-doc" in out
+    assert "📎 참고 근거" in out
+    assert "[1] core-doc" in out
+    assert "[2] 파수꾼 검증 근거" in out
+
+
+def test_finalize_answer_normalizes_bold_reference_heading_before_guardian_insert():
+    from src.agents.generator import _finalize_answer
+
+    out = _finalize_answer(
+        "핵심 답변입니다.\n\n**참고 근거:** core-doc",
+        {
+            "guardian_result": {
+                "enabled": True,
+                "message": "🛡️ 파수꾼 체크\n비용도 함께 확인해야 합니다.",
+            },
+            "guardian_evidence": [
+                {"source": "guard-doc", "content": "비용 주의", "node": "guardian"}
+            ],
+        },
+        [{"source": "core-doc", "content": "상품", "node": "product_agent"}],
+    )
+
+    assert "**참고 근거:**" not in out
+    assert "참고 근거:" not in out
+    assert "\n**\n" not in out
+    assert "📎 참고 근거" in out
+    assert "[1] core-doc" in out
+    assert "[2] 파수꾼 검증 근거" in out
+    assert out.rstrip().endswith("- 동일 상품의 클래스별 총보수·비용 비교")
 
 
 def test_generator_prompt_excludes_guardian_evidence_but_final_references_include_it(monkeypatch):
@@ -347,4 +378,115 @@ def test_generator_prompt_excludes_guardian_evidence_but_final_references_includ
 
     assert "guard-doc" not in captured["prompt"]
     assert "세금 주의" not in captured["prompt"]
-    assert "참고 근거: core-doc; guard-doc" in result["answer"]
+    assert "📎 참고 근거" in result["answer"]
+    assert "[1] core-doc" in result["answer"]
+    assert "[2] 파수꾼 검증 근거" in result["answer"]
+
+
+def test_user_evidence_block_formats_product_and_hides_cost_guard_internal_source():
+    from src.agents.generator import _finalize_answer
+
+    out = _finalize_answer(
+        "말씀하신 상품은 확인됩니다.",
+        {
+            "guardian_result": {
+                "enabled": True,
+                "message": "🛡️ 파수꾼 체크\n더 낮은 클래스가 확인됩니다.",
+            },
+            "guardian_evidence": [
+                {
+                    "source": "Cost Guard canonical: KR518102001M C→C-P2E",
+                    "content": (
+                        "동일 상품코드 KR518102001M 및 동일 계좌유형 퇴직연금/IRP에서 "
+                        "총보수·비용 기준 C=0.95%, C-P2E=0.7%로 구조화 검증된 비용 차이가 확인됩니다. "
+                        "비교 유형=STANDARD."
+                    ),
+                    "node": "guardian",
+                }
+            ],
+        },
+        [
+            {
+                "source": "미래에셋퇴직플랜증권자투자신탁1호(주식) (C)",
+                "content": (
+                    "상품코드=KR518102001M, 클래스=C, 계좌유형=퇴직연금/IRP, 판매채널=오프라인, "
+                    "위험등급=2등급[높은 위험], 유형=주식형, 총보수·비용=0.95%, "
+                    "합성총보수·비용=None%, 투자설명서효력발생일=2025-03-28, "
+                    "시장잔고=10554.0백만원, 잔고기준일=2024-11-30, "
+                    "투자목적=국내 주식에 주로 투자하는 모투자신탁을 주된 투자대상으로 합니다., "
+                    "투자전략=미래에셋퇴직플랜증권모투자신탁(주식)에 60%이상 투자합니다., "
+                    "dataset_version=FROZEN_V1, dataset_status=CONFIRMED"
+                ),
+                "node": "product_agent",
+            }
+        ],
+    )
+
+    assert "📎 참고 근거" in out
+    assert "[1] 미래에셋퇴직플랜증권자투자신탁1호(주식) 투자설명서" in out
+    assert "- 효력발생일: 2025.03.28" in out
+    assert "- 확인 항목: 투자목적, 투자전략, 위험등급, 총보수·비용, 시장잔고" in out
+    assert '핵심 원문(투자전략): "미래에셋퇴직플랜증권모투자신탁(주식)에 60%이상 투자합니다."' in out
+    assert "[2] 파수꾼 검증 근거" in out
+    assert "- C: 0.95%" in out
+    assert "- C-P2E: 0.70%" in out
+    assert "- 차이: 0.25%p" in out
+    assert "Cost Guard canonical" not in out
+    assert "dataset_version" not in out
+    assert "FROZEN_V1" not in out
+
+
+def test_user_evidence_block_keeps_prospectus_snippet_that_starts_with_bracket():
+    from src.agents.generator import _finalize_answer
+
+    out = _finalize_answer(
+        "투자전략은 투자설명서 원문 기준으로 확인됩니다.",
+        {"guardian_result": {"enabled": False}, "guardian_evidence": []},
+        [
+            {
+                "source": "미래에셋퇴직플랜증권자투자신탁1호(주식) 투자설명서 — 투자전략",
+                "content": (
+                    "[미래에셋퇴직플랜증권자투자신탁1호(주식) — 투자전략]\n"
+                    "① 미래에셋퇴직플랜증권모투자신탁(주식)에 60%이상 투자합니다."
+                ),
+                "node": "product_agent",
+            }
+        ],
+    )
+
+    assert "📎 참고 근거" in out
+    assert "- 확인 항목: 투자전략" in out
+    assert "핵심 원문" in out
+    assert "미래에셋퇴직플랜증권모투자신탁(주식)에 60%이상 투자합니다." in out
+
+
+def test_specific_product_answer_uses_verified_draft_without_llm_rewrite(monkeypatch):
+    import src.agents.generator as gen
+
+    called = {"value": False}
+
+    def fake_invoke(_llm, _messages):
+        called["value"] = True
+        raise AssertionError("specific product drafts should not be rewritten")
+
+    monkeypatch.setattr(gen, "invoke_with_retry", fake_invoke)
+
+    node = gen.build_generator_node()
+    result = node({
+        "question": "미래에셋퇴직플랜증권자투자신탁1호(주식) C클래스 특징 알려줘.",
+        "is_safe": True,
+        "scope": "범위내",
+        "response_mode": "complete",
+        "recommendation_stage": "specific_recommendation",
+        "product_draft": "계좌 유형: 퇴직연금/IRP 범위입니다. 계좌 세부유형은 확인이 필요합니다.",
+        "retrieved_context": [{"source": "core-doc", "content": "퇴직연금/IRP 범위", "node": "product_agent"}],
+        "verification": {
+            "grounded": True,
+            "requirements_met": True,
+            "missing_requirements": [],
+            "premise_issues": [],
+        },
+    })
+
+    assert called["value"] is False
+    assert "계좌 유형: 퇴직연금/IRP 범위입니다" in result["answer"]

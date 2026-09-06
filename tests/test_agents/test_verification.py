@@ -802,3 +802,418 @@ def test_strip_tool_call_artifacts_preserves_clean_answer():
 
     answer = "연금저축 세액공제 한도는 연 600만원입니다.\n\n참고 근거: 세액공제 안내"
     assert strip_tool_call_artifacts(answer) == answer
+
+
+# ── 확정된 미지원 수치를 본문에서 제거 (A그룹 회귀) ──────────────────────────
+# 예전에는 경고만 붙이고 본문은 그대로 뒀다. 그러나 사용자는 본문을 먼저 읽고
+# 경고는 맨 아래에 있어, 처음 읽을 때 지어낸 값을 사실로 받아들인다.
+
+
+def test_enforce_unsupported_numbers_drops_fabricated_sentence():
+    """지어낸 수치를 담은 문장을 통째로 제거하고 나머지는 보존한다 (실측 no.27)."""
+    from src.agents.verification import enforce_unsupported_numbers
+
+    answer = (
+        "네, DB형 퇴직연금은 퇴직 시 받을 금액이 사전에 확정되어 있는 구조입니다. "
+        "이는 퇴직 전 3개월간의 평균 임금의 60% 이상으로 계산된다는 규정이 있습니다. "
+        "기본적인 퇴직급여의 액수는 이미 확정된 상태입니다."
+    )
+    out = enforce_unsupported_numbers(answer, ["60%"])
+
+    assert "60%" not in out                    # 본문에서 제거
+    assert "참고용입니다" not in out            # 제거했으므로 경고는 불필요
+    assert "사전에 확정되어 있는 구조" in out   # 나머지 문장은 보존
+    assert "이미 확정된 상태" in out
+
+
+def test_enforce_unsupported_numbers_keeps_numbered_list_intact():
+    """번호 목록 항목은 지우지 않는다 — 번호가 어긋나면 서식이 더 망가진다 (실측 no.140)."""
+    from src.agents.verification import enforce_unsupported_numbers
+
+    answer = (
+        "판단 요소는 다음과 같습니다.\n"
+        "1. **세금**: 중도인출 시 기타소득세 16.5%가 부과될 수 있습니다.\n"
+        "2. **수수료**: 일부 금융기관은 실물이전 수수료를 부과합니다.\n"
+        "3. **상품 특성**: 상품 종류에 따라 장단점이 달라집니다."
+    )
+    out = enforce_unsupported_numbers(answer, ["16.5%"])
+
+    assert "1." in out and "2." in out and "3." in out   # 번호 유지
+    assert "**세금**" in out                              # 항목 제목도 유지
+    assert "참고용입니다" in out                          # 대신 경고로 처리
+
+
+def test_enforce_unsupported_numbers_removes_fabricated_content_inside_numbered_item():
+    """번호 목록 항목이라도 제목 뒤 본문이 창작이면 그 부분만 지운다.
+
+    실측 회귀(20문항 스팟체크 T04 재검증): "번호 목록은 통째로 보존"으로만 두면
+    반대 사고가 난다 — 항목 본문 전체가 지어낸 수치("연간 최대 400만원까지...")일
+    때 그 문장이 그대로 노출됐다. "1."을 문장 부호로 오인해 분리하면서 "번호
+    다음 첫 조각만 보존" 규칙이 번호만 지키고 진짜 제목+본문을 통째로 삭제
+    대상으로 넘기는 2차 버그도 함께 있었다("1.\\n2. ...\\n3. ..."로 항목 1이
+    통째로 사라짐) — 숫자 뒤 마침표에서는 문장을 안 자르도록 고쳤다.
+    """
+    from src.agents.verification import enforce_unsupported_numbers
+
+    answer = (
+        "1. **연금 저축**: 연금저축계좌에 가입할 수 있습니다. "
+        "연간 납입액 중 최대 400만원까지 세액 공제를 받을 수 있으며, "
+        "낮은 세율(3.3%~5.5%)의 연금 소득세를 부담하게 됩니다.\n\n"
+        "2. **퇴직연금(IRP)**: 추가 세액공제 혜택을 받을 수 있습니다. "
+        "연금저축 합산하여 최대 700만원까지 세액공제가 가능합니다."
+    )
+    out = enforce_unsupported_numbers(answer, ["400만원", "3.3%", "5.5%", "700만원"])
+    body = out.split("※")[0]
+
+    assert "400만원" not in body and "700만원" not in body
+    assert "3.3%" not in body and "5.5%" not in body
+    # 항목 제목·번호는 그대로 남는다.
+    assert "1. **연금 저축**" in out and "2. **퇴직연금(IRP)**" in out
+
+
+def test_enforce_unsupported_numbers_falls_back_when_too_short():
+    """본문이 거의 사라지는 경우에는 지우지 않고 경고를 붙인다."""
+    from src.agents.verification import enforce_unsupported_numbers
+
+    answer = "세액공제 한도는 700만원입니다."
+    out = enforce_unsupported_numbers(answer, ["700만원"])
+
+    assert answer in out
+    assert "참고용입니다" in out
+
+
+def test_enforce_unsupported_numbers_preserves_reference_line():
+    """참고 근거 줄은 삭제 대상이 아니다."""
+    from src.agents.verification import enforce_unsupported_numbers
+
+    answer = (
+        "연금저축은 누구나 가입할 수 있습니다. "
+        "세액공제 한도는 700만원입니다. "
+        "자세한 내용은 아래를 참고하세요.\n\n"
+        "참고 근거: 세액공제 안내"
+    )
+    out = enforce_unsupported_numbers(answer, ["700만원"])
+
+    assert "참고 근거: 세액공제 안내" in out
+    assert "700만원" not in out.split("참고 근거:")[0]
+
+
+def test_enforce_unsupported_numbers_still_skips_negation():
+    """부정·교정 문맥은 여전히 손대지 않는다(기존 동작 유지)."""
+    from src.agents.verification import enforce_unsupported_numbers
+
+    answer = "평균 임금의 60%가 아니라 30일분에 계속근로기간을 곱하여 계산됩니다."
+
+    assert enforce_unsupported_numbers(answer, ["60%"]) == answer
+
+
+# ── 제도 용어 오표기 교정 (실측 no.1) ────────────────────────────────────────
+# L0는 숫자만 검사하므로 "DC(Dividend Contribution)" 같은 용어 오류를 구조적으로
+# 잡지 못한다. 제도명 영문 표기는 법령으로 고정돼 있어 코드로 교정해도 안전하다.
+
+
+def test_correct_institution_terms_fixes_dc_expansion():
+    """DC는 Defined Contribution이다 — Dividend는 '배당'이라 무관하다."""
+    from src.agents.verification import correct_institution_terms
+
+    out = correct_institution_terms("DC(Dividend Contribution)형과 DB(Defined Benefit)형은 다릅니다.")
+
+    assert "Defined Contribution" in out
+    assert "Dividend Contribution" not in out
+    assert "Defined Benefit" in out   # 원래 맞는 표기는 그대로
+
+
+def test_correct_institution_terms_leaves_legitimate_dividend():
+    """배당(Dividend)을 뜻하는 정상적인 쓰임은 건드리지 않는다."""
+    from src.agents.verification import correct_institution_terms
+
+    answer = "배당(Dividend) 수익은 재투자됩니다."
+
+    assert correct_institution_terms(answer) == answer
+
+
+def test_correct_institution_terms_is_noop_for_correct_text():
+    from src.agents.verification import correct_institution_terms
+
+    answer = "DC(Defined Contribution)형은 확정기여형입니다."
+
+    assert correct_institution_terms(answer) == answer
+
+
+# ── premise_issues: 사용자의 요청·목표를 "잘못된 전제"로 오인하지 않는다 ──────────
+#
+# 실측 2건(같은 클래스, 표현만 다름 — 1차 수정 후에도 2차가 재발했다):
+#   "안정적인 것을 원한다"        (Q-4 "솔로몬 국공채... 안정적인 걸 원해요")
+#   "노후를 위한 절세 방법이 필요함" ("65세 정년퇴직... 절세를 많이 하고 싶어")
+# 둘 다 최종 답변이 "다음 내용은 사실과 다르거나 과장된 부분이 있어 그대로 전제하기
+# 어렵습니다: 노후를 위한 절세 방법이 필요함"으로 시작해 사용자의 요청을 반박했다.
+
+
+def test_want_statements_are_not_treated_as_premises():
+    """요청·목표·선호·희망은 참·거짓이 없으므로 premise correction 대상이 아니다."""
+    from src.agents.verification import split_premise_issues
+
+    for item in (
+        "노후를 위한 절세 방법이 필요함",
+        "안정적인 것을 원한다",
+        "절세를 많이 하고 싶어함",
+        "노후 준비를 하고 싶다",
+        "수익률 높은 상품을 원해",
+        "상품 추천 요청",
+        # 실측(20문항 스팟체크 T08/T09, 3차 재발): "원해/싶어" 같은 욕구 서술어만
+        # 있고 "-해줘/-주세요" 명령형·"-까요" 청유형 의문문이 endings 목록에 빠져
+        # 있었다. 최종 답변이 "안정적인 상품 추천해줘"라는 사용자 요청 문장 자체를
+        # "사실과 다르거나 과장된 전제"라며 반박하는 문장으로 시작했다.
+        "안정적인 상품 추천해줘",
+        "공격적으로 투자하고 싶은데 뭐가 좋을까요?",
+        "안전한 상품 알려주세요",
+        # 같은 스팟체크에서 T04가 이어서 뚫렸다: "노후 대비 뭐부터 시작해야
+        # 하나요?"는 무엇을 해야 할지 묻는 순수 정보 요청인데 "-해야 하나요?"
+        # 종결이 빠져 있었다. "명령형/청유형"만 넓히고 "의문형 방법 질의"를
+        # 놓치는 같은 실수가 한 세션 안에서 반복됐다 — endings 나열 방식 자체의
+        # 구조적 한계다(이 함수의 다른 결함들과 같은 클래스).
+        "노후 대비 뭐부터 시작해야 하나요?",
+        "연금 처음 시작하는데 뭐 사야 하나요?",
+    ):
+        real, _misfiled = split_premise_issues([item], [])
+        assert real == [], f"요청/목표가 전제로 남았다: {item}"
+
+
+def test_factual_false_premises_are_still_kept():
+    """참·거짓을 따질 수 있는 사실 주장은 그대로 교정 대상으로 남는다(과잉 필터 방지).
+
+    CASE 3(IRP 원금보장)·CASE 4(위험등급 6등급)에 해당한다 — 이쪽까지 걸러내면
+    정작 바로잡아야 할 오해를 그냥 통과시키게 된다.
+    """
+    from src.agents.verification import split_premise_issues
+
+    for item in (
+        "IRP가 원금보장 상품이라고 전제하고 있으나 실적배당형도 편입 가능함",
+        "위험등급 6등급이 가장 위험하다고 보고 있으나 1등급이 가장 위험함",
+        "세금 감면이 어마어마하다는 과장된 전제",
+        "중도인출이 자유롭다는 잘못된 전제",
+    ):
+        real, _misfiled = split_premise_issues([item], [])
+        assert real == [item], f"진짜 전제 오류가 걸러졌다: {item}"
+
+
+def test_want_ending_with_factual_claim_stays_a_premise():
+    """욕구 어미로 끝나도 사실 주장이 섞여 있으면 교정 대상으로 남긴다.
+
+    _FALSE_PREMISE_MARKERS 확인이 is_want_statement보다 먼저 와야 한다는 순서 보장.
+    """
+    from src.agents.verification import split_premise_issues
+
+    item = "원금보장이 된다고 잘못 알고 원함"
+    real, _misfiled = split_premise_issues([item], [])
+
+    assert real == [item]
+
+
+def test_institutional_claims_survive_benign_filters():
+    """"제도가 이렇게 작동한다"는 주장은 무해 필터에 걸려 사라지면 안 된다.
+
+    실측: _BENIGN_CONDITION_MARKERS의 "이라는 전제"/"라는 전제"가 진짜 전제 오류 5개 중
+    4개를 조용히 걸러냈다. "이라는/라는"은 앞 명사의 받침 유무로 갈리는 조사일 뿐이라
+    판정이 의미가 아니라 철자에 좌우됐다 — "원금보장 상품**이라는** 전제"는 필터링되고
+    "중도인출이 가능하다**는** 전제"는 통과하는 식이었다.
+
+    숫자 분기·"DB형" 마커도 같은 문제를 안고 있어(주제어만 보고 무해 판정) 제도 주장을
+    함께 삼켰다: 폐지된 한도("700만원"), 틀린 제도 이해("DB형도 중도인출이 된다").
+    """
+    from src.agents.verification import split_premise_issues
+
+    for item in (
+        "IRP는 원금보장 상품이라는 전제",
+        "위험등급 6등급이 가장 위험하다는 전제",
+        "DB형도 중도인출이 된다는 전제",
+        "연금저축 한도가 700만원이라는 전제",
+        "55세 이전에도 연금수령이 가능하다는 전제",
+    ):
+        real, _misfiled = split_premise_issues([item], [])
+        assert real == [item], f"제도 주장이 무해로 걸러졌다: {item}"
+
+
+def test_user_supplied_conditions_are_still_filtered():
+    """사용자가 준 자기 조건을 되뇐 항목은 그대로 무해 처리한다(과잉 교정 방지).
+
+    제도 주장과의 차이는 서술 대상이다 — 조건 되뇜은 "내 상황이 얼마"를 옮길 뿐이고,
+    제도 주장은 "규정상 이렇다"를 말한다.
+    """
+    from src.agents.verification import split_premise_issues
+
+    for item in (
+        "잔금지급일이 2026년 1월 31일이라고 가정",
+        "2026년 5월 10일이 피해발생일이라는 전제",
+        "만 65세라는 전제",
+        "요양종료일이 2026년 3월 2일이라는 전제",
+    ):
+        real, _misfiled = split_premise_issues([item], [])
+        assert real == [], f"사용자 조건이 교정 대상으로 남았다: {item}"
+
+
+# ── 결정론 경로의 과장 전제 교정 ────────────────────────────────────────────
+#
+# ④grounding은 결정론 답변에서 통째로 우회된다(불필요한 repair 47/184건을 막기 위한
+# 의도된 설계). 그 부작용으로 premise_issues가 항상 빈 리스트로 고정돼 **전제 교정이
+# 결정론 경로에서 아예 작동하지 않았다** — 실측 T18("세금 거의 안 낸다던데")과
+# 요강 참고질의("세금 감면이 어마어마하다던데")가 모두 이 경로였다.
+# 요강 평가지표 "정확성"이 명시적으로 요구하는 항목이라, LLM을 다시 부르지 않고
+# 코드로 과장 전제만 찾아 채운다.
+
+
+def test_detects_exaggerated_tax_premise():
+    """"세금 거의 안 낸다더라"류 과장 전제를 결정론적으로 잡는다."""
+    from src.agents.verification import detect_exaggerated_tax_premise
+
+    for question in (
+        "58세인데 퇴직금 받아서 연금으로 굴리면 세금 거의 안 낸다던데 맞나요?",
+        "명퇴수당을 연금계좌에 넣으면 세금 감면이 어마어마하다던데, 절세법만 알려주세요",
+        "연금저축은 세금 혜택이 무제한이라던데, 노후 준비로 최대한 활용하고 싶어요",
+        "IRP에 퇴직금 넣으면 세액공제도 되고 세금도 없다던데 사실인가요?",
+    ):
+        assert detect_exaggerated_tax_premise(question), question
+
+
+def test_normal_tax_questions_are_not_flagged_as_exaggeration():
+    """과장 표현·인용 어미가 없으면 잡지 않는다(정상 질문에 교정문을 붙이면 안 된다).
+
+    "세금 거의 안 내는 방법이 있나요?"는 **질문**이지 들은 이야기의 확인이 아니라
+    과장 전제가 아니다 — 인용 어미를 함께 요구하는 이유다.
+    """
+    from src.agents.verification import detect_exaggerated_tax_premise
+
+    for question in (
+        "연금저축 세액공제 얼마까지 되나요?",
+        "65세인데 노후 절세 방법 알려줘",
+        "세금 거의 안 내는 방법이 있나요?",
+        "퇴직금 세금이 얼마나 나오나요?",
+        "세금 없는 상품이 있나요?",
+    ):
+        assert detect_exaggerated_tax_premise(question) == [], question
+
+
+# ── 범위 표기 '~' 처리 (실측 S02) ────────────────────────────────────────────
+# '~'를 취소선 서식으로 보고 무조건 지우면 "5~6등급"이 "56등급"으로 뭉개져,
+# 근거에 있을 수 없는 유령 수치를 L0가 "지어낸 값"으로 확정한다.
+
+
+def test_number_range_does_not_create_phantom_token():
+    """범위 표기의 양끝이 붙어 없는 수치가 만들어지면 안 된다."""
+    from src.agents.verification import extract_number_tokens
+
+    tokens = extract_number_tokens("- 투자성향: 안정형(위험등급 5~6등급으로 해석)")
+
+    assert "56등급" not in tokens
+    assert tokens == ["5등급", "6등급"]
+
+
+def test_number_range_captures_both_ends():
+    """범위의 앞 숫자는 단위가 없어 놓치기 쉽다 — 양끝 모두 검사 대상이어야 한다."""
+    from src.agents.verification import extract_number_tokens
+
+    assert extract_number_tokens("만 55~70세는 5.5%") == ["55세", "70세", "5.5%"]
+    assert extract_number_tokens("연금소득세 3.3~5.5%") == ["3.3%", "5.5%"]
+
+
+def test_strikethrough_markup_is_still_stripped():
+    """취소선(~~)은 서식이므로 계속 제거한다."""
+    from src.agents.verification import extract_number_tokens, strip_inline_markup
+
+    assert extract_number_tokens("~~취소선~~ 900만원") == ["900만원"]
+    assert "~~" not in strip_inline_markup("~~900만원~~")
+
+
+# ── issues(근거 없는 단정) 코드 강제 ─────────────────────────────────────────
+# ④ 출력 중 issues만 코드 강제가 없었다. 실측(501문항): grounded=False 46건 중
+# 32건이 "확정 수치 없이 issues만" 있는 경우였고, 그중 6건은 한계 고지조차 없었다.
+
+
+def test_enforce_unsupported_claims_adds_disclosure():
+    """근거 없는 단정을 지적한 issue에는 한계를 고지한다."""
+    from src.agents.verification import enforce_unsupported_claims
+
+    answer = "배우자 명의 연금저축에 납입하면 세액공제를 받을 수 없습니다."
+    issue = "배우자의 명의로 납입한 경우에 세액공제가 안된다는 정보는 제공된 근거 없이 작성됨"
+    out = enforce_unsupported_claims(answer, [issue])
+
+    assert answer in out                      # 본문은 지우지 않는다(위치를 특정할 수 없다)
+    assert "확인되지 않아 참고용" in out
+    assert issue in out
+
+
+def test_enforce_unsupported_claims_skips_benign_issue():
+    """④가 issues 칸에 '문제 없다'고 적는 경우가 있다 — 고지를 붙이면 안 된다."""
+    from src.agents.verification import enforce_unsupported_claims
+
+    answer = "연금저축은 누구나 가입할 수 있습니다."
+    benign = "초안은 구체적인 수치나 단정적인 주장을 포함하지 않으므로, 이 부분은 문제가 없습니다."
+
+    assert enforce_unsupported_claims(answer, [benign]) == answer
+
+
+def test_enforce_unsupported_claims_skips_omission_issue():
+    """'답변이 빠뜨렸다'는 지적은 enforce_missing_requirements 담당이라 중복 고지하지 않는다."""
+    from src.agents.verification import enforce_unsupported_claims
+
+    answer = "연금저축은 누구나 가입할 수 있습니다."
+    omission = "초안은 질문에 직접적으로 답변하지 않으며 관련 정보를 제공하지 않습니다."
+
+    assert enforce_unsupported_claims(answer, [omission]) == answer
+
+
+def test_enforce_unsupported_claims_respects_existing_disclosure():
+    """이미 한계를 고지한 답변에는 덧붙이지 않는다(중복 방지)."""
+    from src.agents.verification import enforce_unsupported_claims
+
+    answer = "해당 내용은 제공된 자료로는 확인이 어렵습니다."
+
+    assert enforce_unsupported_claims(answer, ["근거 없이 단정적으로 서술됨"]) == answer
+
+
+def test_enforce_unsupported_claims_no_issues_is_noop():
+    from src.agents.verification import enforce_unsupported_claims
+
+    answer = "연금저축 세액공제 한도는 600만원입니다."
+    assert enforce_unsupported_claims(answer, []) == answer
+
+
+# ── 역질문에 일반 기준 포함 여부 관측 (has_general_guidance) ─────────────────
+# 이 함수는 판정만 하고 답변을 고치거나 새 내용을 만들지 않는다 — think_trace에만
+# 남는 관측 신호다. 없는 내용을 코드가 지어내 채우면 이 프로젝트가 하루 종일
+# 고쳐온 할루시네이션 문제를 이 자리에 새로 만드는 셈이라 강제하지 않는다.
+
+
+def test_has_general_guidance_true_when_no_marker():
+    """애초에 역질문이 아니면 이 판정 대상이 아니다 — 위반으로 보지 않는다."""
+    from src.agents.verification import has_general_guidance
+
+    assert has_general_guidance("연금저축 세액공제 한도는 600만원입니다.") is True
+
+
+def test_has_general_guidance_false_when_questions_only():
+    """일반 기준 없이 역질문만 있으면 위반으로 판정한다."""
+    from src.agents.verification import has_general_guidance
+
+    answer = "부족한 정보는 계좌유형, 투자기간입니다. 알려주세요. [추가 확인 필요]"
+    assert has_general_guidance(answer) is False
+
+
+def test_has_general_guidance_true_when_body_present():
+    """마커 앞에 실질적인 일반 기준 문장이 있으면 정상으로 판정한다."""
+    from src.agents.verification import has_general_guidance
+
+    answer = (
+        "연금저축은 소득이 없어도 누구나 가입할 수 있지만, IRP는 직장인·자영업자 등 "
+        "가입대상이 정해져 있습니다. 세액공제 대상 한도는 연금저축 600만원, IRP 포함 "
+        "900만원입니다.\n\n구체적인 계산을 위해서는 소득 정보가 필요합니다. [추가 확인 필요]"
+    )
+    assert has_general_guidance(answer) is True
+
+
+def test_has_general_guidance_true_for_honest_no_evidence_disclosure():
+    """근거가 정말 없어 한계만 고지하고 역질문하는 것은 정당하다 — 위반이 아니다."""
+    from src.agents.verification import has_general_guidance
+
+    answer = "자료에 없어 확인이 어렵습니다. [추가 확인 필요]"
+    assert has_general_guidance(answer) is True

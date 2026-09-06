@@ -17,7 +17,9 @@ from pydantic import BaseModel, Field
 from src.agents.context import format_conversation_history
 from src.agents.deterministic_info import (
     CODE_OVERRIDABLE_CATEGORIES,
+    TAX_FALLBACK_CATEGORIES,
     candidate_categories,
+    deterministic_miss_signal,
     deterministic_response_for,
 )
 from src.agents.in_kind_transfer_intent import has_in_kind_transfer_intent
@@ -162,6 +164,13 @@ ROUTER_SYSTEM_PROMPT = """당신은 연금 상담 AI의 질문 분류 게이트�
      ⚠️ 납입액과 소득금액이 질문에 둘 다 숫자로 나와 있으면 이 카테고리가 아니라
      "해당없음"입니다 — 계산 가능한 질문은 정형 답변으로 가로채지 말고 계산 툴로
      넘겨야 합니다.
+   - 퇴직연금_유형비교: DB/DC/퇴직금제도의 운용 주체, 확정되는 대상, 급여·부담금 산식,
+     운용성과 부담을 비교하는 질문. 공식 문장과 일치하지 않아도 DB/DC의 불변 사실을
+     묻는 변형 질문이면 이 카테고리입니다.
+   - 퇴직급여_연금계좌_세금전제검증: 명퇴수당·퇴직금·퇴직급여를 IRP/연금계좌에 넣으면
+     세금이 없어지는지, 얼마나 줄어드는지, 무조건 유리한지 묻는 질문. 이 카테고리는
+     절세액을 계산하는 경로가 아니라, 명칭만으로 재원을 확정하지 않고 과세이연/면세
+     혼동과 부족정보를 먼저 잡는 Gate입니다.
    - 세액공제_한도: 세액공제 대상 납입한도(600만원/900만원)나 공제율이 몇 %인지 등
      제도 자체의 한도·기준을 묻는 질문 (본인 수치를 대입한 계산 요청이 아님).
    - 세금혜택_개요: 연금계좌의 세금 혜택 전반을 개괄적으로 설명해달라는 질문.
@@ -227,7 +236,14 @@ ROUTER_SYSTEM_PROMPT = """당신은 연금 상담 AI의 질문 분류 게이트�
      ⚠️ 연금소득세(사적연금소득 종합과세) 질문과 혼동하지 마세요 — 퇴직소득세감면은
      "퇴직소득세"/"이연퇴직소득세"라는 단어가 명시된 경우만입니다.
    - 연금소득세_종합과세: 사적연금소득이 연 1,500만원을 넘을 때 종합과세/분리과세
-     선택 기준을 묻는 질문.
+     선택 기준을 묻는 질문. **사용자가 본인 연금 수령액을 금액으로 제시한 경우도
+     여기 포함됩니다** — "연금소득이 1,600만원이야"처럼 질문 형태가 아니어도, 그
+     금액이 1,500만원 기준에 걸리는지가 곧 답해야 할 내용입니다. 정형 답변은 기준과
+     판정 대상 재원(세액공제 받은 납입금·운용수익만 포함, 세액공제 안 받은 원금과
+     퇴직금은 제외)만 설명하고 **사용자 금액이 과세대상인지는 단정하지 않으므로**,
+     재원이 불분명해도 확정해서 답할 수 있습니다.
+     ⚠️ 다만 **납입액**을 말한 질문("연금저축에 600만원 넣으면")은 수령이 아니라
+     납입이므로 이 카테고리가 아닙니다.
    - 연금소득세율_연령별: 연금을 받을 때 적용되는 연금소득세율이 몇 %인지 묻는 질문
      (예: "연금 받으면 세율이 얼마인가요", "만 74세인데 몇 % 떼나요").
      ⚠️ 이 카테고리는 나이가 질문에 있어도 기각하지 않습니다 — 다른 카테고리와 달리
@@ -238,6 +254,18 @@ ROUTER_SYSTEM_PROMPT = """당신은 연금 상담 AI의 질문 분류 게이트�
      예: 중도인출 신청기한+필요서류+세금, DB형 가능여부+주택구입 신청기한+서류,
      퇴직금 중도인출분 세금+나머지 연금수령 세금. 이 경우 단일 세금/기한/요건
      카테고리로 전체 질문을 대표하지 말고, 복합정보_태스크플랜을 우선 선택합니다.
+   - 제도비교_DB_DC: DB형·DC형의 **제도 차이**(운용주체·급여 계산방식)를 설명해달라는
+     질문. "DB와 DC 차이가 뭔가요", "DC는 제가 운용하는 게 맞나요"처럼 제도 일반론을
+     묻는 경우만 확정합니다. ⚠️ "제 DB 퇴직금이 얼마인가요"처럼 본인 상황의 구체적
+     계산을 요구하면 이 카테고리가 아니라 해당없음입니다(위 "일반형만 확정한다" 원칙).
+   - 계좌이전_절차: IRP·연금저축 계좌를 **다른 금융기관으로 이전**하거나 **다른 종류의
+     계좌로 이체**하는 절차·조건을 묻는 일반 질문. "IRP 계좌를 다른 증권사로 옮기려면
+     어떻게 해야 하나요", "실물이전이 뭔가요" 등. ⚠️ 본인이 보유한 구체적 상품 유형이나
+     조건을 대입한 개별 판정 요구("제가 가진 MMF도 실물이전 되나요")는 해당없음입니다.
+   - 계좌선택_가이드: 연금저축과 IRP 중 **어떤 계좌를 선택할지, 둘 다 가입해야 하는지**를
+     묻는 질문. "IRP만 만들어도 되나요, 연금저축도 같이 만들어야 하나요", "연금저축과
+     IRP 뭐가 다른가요" 등. ⚠️ 본인 소득에 대입한 구체적 세액공제액 계산 요구는
+     해당없음입니다(세액공제_계산_입력부족/개인세금_입력충분성이 담당).
    - 해당없음: 위 어디에도 명확히 안 속하거나, 판단이 애매한 경우.
 
 [이전 대화]가 함께 주어지면, "그거 다시 설명해줘", "방금 말한 상품 중 두 번째는?"처럼 현재
@@ -264,6 +292,11 @@ class RouterDecision(BaseModel):
     safety_reason: Optional[str] = Field(default=None, description="is_safe=False일 때만 사유를 적는다")
     deterministic_category: Literal[
         "복합정보_태스크플랜",
+        "제도비교_DB_DC",
+        "계좌이전_절차",
+        "계좌선택_가이드",
+        "퇴직연금_유형비교",
+        "퇴직급여_연금계좌_세금전제검증",
         "세액공제_계산_입력부족",
         "세액공제_한도",
         "세금혜택_개요",
@@ -497,6 +530,19 @@ def _restore_rejected_category(category: str, candidates: list[str], question: s
             continue
         if deterministic_response_for(candidate, question) is not None:
             return candidate
+
+    # ⚠️ 후보가 0건이면 위 루프는 아무것도 하지 못한다 — 되살릴 대상 자체가 없다.
+    # 세제 영역에서는 바로 이 "후보 0건"이 반복된 실패 원인이었다(퇴직금/1,600만원/
+    # 절세방법/납입한도…). 사용자가 제도 용어를 모른 채 일상어로 묻기 때문인데,
+    # 표현은 무한하고 키워드 목록은 유한해서 커버리지를 넓히는 방식으로는 못 이긴다.
+    #
+    # 그래서 세제에 한해 판정 순서를 뒤집는다: 키워드로 차단하는 대신, 세제 핸들러에게
+    # 직접 물어보고 답을 내는 것이 있으면 그걸 쓴다. 핸들러는 자기 소관이 아니면 스스로
+    # None을 내므로(세제 무관·인접 주제 8종 검증) 엉뚱한 정형 답변이 나가지 않는다.
+    # 다른 영역(중도인출·실물이전·디폴트옵션 등)은 잘 작동하므로 건드리지 않는다.
+    for fallback in TAX_FALLBACK_CATEGORIES:
+        if deterministic_response_for(fallback, question) is not None:
+            return fallback
     return category
 
 
@@ -517,6 +563,11 @@ def _prioritize_collision_category(category: str, candidates: list[str], questio
         and deterministic_response_for("복합정보_태스크플랜", question) is not None
     ):
         return "복합정보_태스크플랜"
+    if (
+        "퇴직급여_연금계좌_세금전제검증" in candidates
+        and deterministic_response_for("퇴직급여_연금계좌_세금전제검증", question) is not None
+    ):
+        return "퇴직급여_연금계좌_세금전제검증"
     if (
         category in {"중도인출_일반", "중도인출_기한판정"}
         and "중도인출_요건판정" in candidates
@@ -607,6 +658,9 @@ def build_router_node():
             decision.is_safe, decision.safety_reason, state["question"]
         )
         withdrawal_context = extract_withdrawal_context(state["question"])
+        # 정형 주제어가 있는데 후보가 0건이면 관측용 신호를 남긴다 — 판정은 바꾸지
+        # 않는다. 이 누락은 지금까지 조용히 넘어가 틀린 답이 나가야만 발견됐다.
+        miss_signal = deterministic_miss_signal(state["question"])
         return {
             "intent": intent,
             "scope": scope,
@@ -614,6 +668,7 @@ def build_router_node():
             "is_safe": is_safe,
             "safety_reason": safety_reason,
             "deterministic_category": deterministic_category,
+            "deterministic_miss_signal": miss_signal,
             "withdrawal_context": withdrawal_context.to_state_dict() if withdrawal_context else None,
         }
 

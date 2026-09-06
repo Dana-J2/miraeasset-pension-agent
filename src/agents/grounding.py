@@ -36,10 +36,17 @@ from src.agents.verification import (
     apply_requirement_scope_override,
     apply_withdrawal_context_override,
     apply_source_limited_override,
+    detect_exaggerated_tax_premise,
     find_unsupported_numbers,
 )
 
 GROUNDING_MODEL = "HCX-007"
+
+# ③ product_agent가 코드로 생성하는 고지 문구에 등장하는 수치들. LLM 창작이 아니라
+# 실제 검색 조건(_search_args_from_profile)이라 근거 대조 대상이 아니다.
+_CODE_GENERATED_NUMERIC_TEXTS = (
+    "위험등급 5~6등급 위험등급 4등급 이상 위험등급 1~3등급",
+)
 
 GROUNDING_SYSTEM_PROMPT = """당신은 연금 상담 AI의 답변 검증기입니다. [질문], [초안 답변],
 [근거](번호 매김), [코드 검사: 근거에 없는 것으로 보이는 수치]를 보고 세 가지를 확인하세요.
@@ -84,6 +91,24 @@ GROUNDING_SYSTEM_PROMPT = """당신은 연금 상담 AI의 답변 검증기입�
 2. premise_issues: 질문 자체에 사실과 다르거나 과장된 전제("세금 감면이 어마어마하다던데" 같은
    유도성 표현, 잘못된 제도 이해 등)가 섞여 있는데 초안이 그걸 그대로 받아들이고 넘어갔다면,
    어떤 전제를 바로잡아야 하는지 premise_issues에 적으세요. 문제 없으면 빈 리스트로 둡니다.
+
+   ⚠️ **여기에 담을 수 있는 것은 "사용자가 사실이라고 주장한 진술"뿐입니다.** 세 조건을
+   모두 만족할 때만 적으세요: ⓐ 사용자가 명시적으로 말했고, ⓑ 참·거짓을 따질 수 있는
+   사실 주장이며, ⓒ 근거가 그것과 직접 충돌한다. 하나라도 아니면 빈 리스트로 두세요.
+
+   **절대 premise_issues에 넣지 마세요 — 사용자의 요청·목표·선호·희망·계획·정보요청**:
+     - "절세를 많이 하고 싶어"       → 목표. 참·거짓이 없다
+     - "노후를 위한 절세 방법이 필요함" → 필요 서술. 참·거짓이 없다
+     - "안정적인 것을 원한다"         → 선호. 참·거짓이 없다
+     - "추천해줘" / "알려줘"          → 정보 요청. 참·거짓이 없다
+   사용자가 무언가를 **원한다는 사실 자체**는 틀릴 수가 없습니다. 이것을 "사실과 다르거나
+   과장된 전제"라고 적으면, 최종 답변이 "다음 내용은 사실과 다릅니다: 절세 방법이 필요함"
+   처럼 사용자의 요청을 반박하는 문장으로 시작합니다(실측 사고).
+
+   **반대로 이런 것은 정상적인 premise_issues입니다** — 참·거짓을 따질 수 있는 주장:
+     - "IRP는 원금보장 상품이지?"      → 제도에 대한 사실 주장. 근거와 충돌하면 교정 대상
+     - "위험등급 6등급이 제일 위험하지?" → 사실 주장. 근거와 충돌하면 교정 대상
+     - "세금 감면이 어마어마하다던데"    → 정도에 대한 주장. 과장이면 교정 대상
 
 3. requirements_met / missing_requirements: 질문이 요구한 항목(여러 개를 동시에 물었다면 그
    전부)을 초안이 빠짐없이 다뤘는지 확인하세요. 하나라도 빠졌다면 requirements_met=False로
@@ -147,12 +172,18 @@ def build_grounding_node():
         # 이렇게 불필요한 repair를 돌았다 — repair는 같은 결정론 함수를 다시 불러
         # 100% 동일한 draft를 재생산하므로 LLM 호출만 낭비되고 결과는 바뀌지 않는다.
         if state.get("deterministic_info") and not state.get("product_draft"):
+            # ⚠️ 이 우회는 premise_issues까지 빈 리스트로 고정하는데, 그 부작용으로
+            # **전제 교정이 결정론 경로에서 아예 작동하지 않았다**(실측 T18 "세금 거의
+            # 안 낸다던데", 요강 참고질의 "세금 감면이 어마어마하다던데" 모두 이 경로).
+            # 요강 평가지표 "정확성"이 명시적으로 요구하는 항목이라 그냥 둘 수 없다.
+            # LLM을 다시 부르지 않고 코드로 과장 전제만 찾아 채운다 — 우회의 이점
+            # (불필요한 repair 47/184건 제거)은 그대로 두면서 교정만 되살린다.
             return {
                 "verification": {
                     "grounded": True,
                     "issues": [],
                     "unsupported_numbers_confirmed": [],
-                    "premise_issues": [],
+                    "premise_issues": detect_exaggerated_tax_premise(state["question"]),
                     "requirements_met": True,
                     "missing_requirements": [],
                 }
@@ -168,6 +199,12 @@ def build_grounding_node():
         # 지원 근거로 넣지 않는다.
         history = state.get("conversation_history") or []
         user_texts = [state["question"], *(turn.get("question", "") for turn in history)]
+        # ③이 **코드로** 붙이는 해석 고지("투자성향: 안정형(위험등급 5~6등급으로 해석)")의
+        # 수치는 LLM이 지어낸 값이 아니라 _search_args_from_profile이 실제로 건 검색
+        # 조건이다. 근거 문서에 있을 이유가 없으므로 L0가 "지어낸 수치"로 확정하면
+        # 오탐이다(실측 S02: 5등급·6등급이 unsupported로 확정됐다).
+        # 사용자 발화 수치를 면제하는 것과 같은 이유 — 출처가 LLM이 아닌 값이다.
+        user_texts.extend(_CODE_GENERATED_NUMERIC_TEXTS)
         suspects = find_unsupported_numbers(
             draft, [c["content"] for c in context], user_texts=user_texts
         )
